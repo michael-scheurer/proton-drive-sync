@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+#
+# proton-sync-daemon — one-way sync of a local folder to Proton Drive.
+#
+#   proton-sync-daemon           watch mode: sync once, then re-sync whenever
+#                                a change is detected (inotifywait if
+#                                available, polling otherwise)
+#   proton-sync-daemon --once    single sync pass, then exit
+#
+# Configuration (created by the Proton Sync settings app):
+#   $XDG_CONFIG_HOME/proton-sync/config          KEY='VALUE' lines, sourced
+#   $XDG_CONFIG_HOME/proton-sync/excludes.list   absolute paths, one per line
+#
+# Config keys: LOCAL_ROOT, REMOTE_ROOT, POLL_INTERVAL, DEBOUNCE,
+#              PROTON_DRIVE_CLI (optional path to the proton-drive binary)
+#
+# Behavior notes:
+#   - One-way upload only; local deletions are not propagated.
+#   - Unchanged files are skipped (content dedup by the CLI), changed files
+#     are replaced, folders are merged.
+#   - Exits 0 (not an error) when unconfigured or not logged in, so login
+#     managers and systemd don't spin on a setup that isn't finished yet.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------- config ---
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/proton-sync"
+CONFIG_FILE="$CONFIG_DIR/config"
+EXCLUDES_FILE="$CONFIG_DIR/excludes.list"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/proton-sync"
+LOG_FILE="$STATE_DIR/sync.log"
+LOCK_FILE="$STATE_DIR/daemon.lock"
+PID_FILE="$STATE_DIR/daemon.pid"
+STAMP_FILE="$STATE_DIR/last-sync-stamp"
+STATUS_FILE="$STATE_DIR/status.json"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+MANIFEST_FILE="$STATE_DIR/manifest.txt"
+MAX_LOG_BYTES=$((5 * 1024 * 1024))
+LOCK_WAIT="${LOCK_WAIT:-30}"
+
+# defaults, overridable via config file
+LOCAL_ROOT=""
+REMOTE_ROOT=""
+POLL_INTERVAL=300
+DEBOUNCE=30
+PROTON_DRIVE_CLI=""
+# When "true", a file deleted locally is moved to the Proton Drive trash on
+# the next pass (recoverable there). Anything deleted while this was off, or
+# before the first pass recorded it, is never touched.
+SYNC_DELETES=false
+
+mkdir -p "$STATE_DIR"
+# shellcheck disable=SC1090
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+log() { printf '%s  %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG_FILE"; }
+
+rotate_log() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  local size
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  if (( size > MAX_LOG_BYTES )); then
+    mv -f "$LOG_FILE" "$LOG_FILE.1"
+  fi
+}
+
+find_cli() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local candidates=(
+    "${PROTON_DRIVE_CLI:-}"
+    "${SNAP:-}/bin/proton-drive"
+    "$script_dir/proton-drive"
+    "$script_dir/../proton-drive"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -n "$c" && -x "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  command -v proton-drive 2>/dev/null && return 0
+  return 1
+}
+
+# ------------------------------------------------------- status reporting ---
+# The settings app visualizes these. status.json holds the live state,
+# history.jsonl gets one line per completed sync pass.
+PASS_ITEMS=0; PASS_BYTES=0; PASS_ERRORS=0; PASS_SKIPPED=0; PASS_TRASHED=0
+PASS_STARTED=0
+TOTAL_ITEMS=0; TOTAL_BYTES=0; TOTAL_ERRORS=0; TOTAL_TRASHED=0; PASSES_DONE=0
+
+json_escape() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
+
+write_status() {  # <state> [current item]
+  {
+    printf '{"state":"%s","ts":%s,"pid":%s' "$1" "$(date +%s)" "$$"
+    printf ',"pass_started":%s,"pass_items":%s,"pass_bytes":%s,"pass_errors":%s,"pass_skipped":%s,"pass_trashed":%s' \
+      "$PASS_STARTED" "$PASS_ITEMS" "$PASS_BYTES" "$PASS_ERRORS" "$PASS_SKIPPED" "$PASS_TRASHED"
+    printf ',"total_items":%s,"total_bytes":%s,"total_errors":%s,"total_trashed":%s,"passes_done":%s' \
+      "$TOTAL_ITEMS" "$TOTAL_BYTES" "$TOTAL_ERRORS" "$TOTAL_TRASHED" "$PASSES_DONE"
+    printf ',"current":"%s"}\n' "$(json_escape "${2:-}")"
+  } > "$STATUS_FILE.tmp" && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
+
+append_history() {
+  printf '{"start":%s,"end":%s,"items":%s,"bytes":%s,"errors":%s,"skipped":%s,"trashed":%s}\n' \
+    "$PASS_STARTED" "$(date +%s)" "$PASS_ITEMS" "$PASS_BYTES" "$PASS_ERRORS" \
+    "$PASS_SKIPPED" "$PASS_TRASHED" >> "$HISTORY_FILE"
+  if (( $(wc -l < "$HISTORY_FILE") > 400 )); then
+    tail -n 300 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" \
+      && mv -f "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+  fi
+}
+
+# Parse "Uploaded: N items (X UNIT)" from a transfer summary -> "N BYTES".
+parse_uploaded() {
+  awk '/Uploaded:/ { n=$2; v=$4; u=$5; gsub(/[()]/, "", v); gsub(/[()]/, "", u) }
+       END {
+         m = (u=="B") ? 1 : (u=="KiB") ? 1024 : (u=="MiB") ? 1048576 : \
+             (u=="GiB") ? 1073741824 : (u=="TiB") ? 1099511627776 : 0
+         printf "%d %d\n", n+0, v*m
+       }' <<< "$1"
+}
+
+# --------------------------------------------------------------- helpers ---
+declare -a EXCLUDES=()
+
+load_excludes() {
+  EXCLUDES=()
+  if [[ -f "$EXCLUDES_FILE" ]]; then
+    local line
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      EXCLUDES+=( "${line%/}" )
+    done < "$EXCLUDES_FILE"
+  fi
+}
+
+is_excluded() {
+  local p="$1" e
+  for e in "${EXCLUDES[@]}"; do [[ "$p" == "$e" ]] && return 0; done
+  return 1
+}
+
+has_excluded_inside() {
+  local dir="$1" e
+  for e in "${EXCLUDES[@]}"; do [[ "$e" == "$dir"/* ]] && return 0; done
+  return 1
+}
+
+ensure_remote_folder() {  # <remote parent> <name> — ok if it already exists
+  "$CLI" filesystem create-folder "$1" "$2" >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------ sync ---
+sync_dir() {
+  local local_dir="$1" remote_path="$2" entry name out items bytes
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    if is_excluded "$entry"; then
+      log "skip (excluded): $entry"
+      (( PASS_SKIPPED++ )) || true
+      continue
+    fi
+    if [[ -d "$entry" ]] && has_excluded_inside "$entry"; then
+      ensure_remote_folder "$remote_path" "$name"
+      sync_dir "$entry" "$remote_path/$name"
+    else
+      log "upload: $entry  ->  $remote_path/"
+      write_status syncing "$entry"
+      if out="$("$CLI" filesystem upload -d merge -f replace "$entry" "$remote_path" 2>&1)"; then
+        printf '%s\n' "$out" >> "$LOG_FILE"
+        read -r items bytes <<< "$(parse_uploaded "$out")"
+        (( PASS_ITEMS += items, TOTAL_ITEMS += items )) || true
+        (( PASS_BYTES += bytes, TOTAL_BYTES += bytes )) || true
+      else
+        printf '%s\n' "$out" >> "$LOG_FILE"
+        log "ERROR: upload failed for $entry (see $LOG_FILE)"
+        (( PASS_ERRORS++, TOTAL_ERRORS++ )) || true
+      fi
+      write_status syncing "$entry"
+    fi
+  done < <(find "$local_dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+}
+
+# Create every folder of REMOTE_ROOT below /my-files ("/my-files/a/b" ->
+# /my-files/a, then /my-files/a/b). Existing folders are left alone.
+ensure_remote_root() {
+  local rest="${REMOTE_ROOT#/my-files}"
+  rest="${rest#/}"
+  local IFS='/' part="/my-files" seg segs
+  read -ra segs <<< "$rest"
+  for seg in "${segs[@]}"; do
+    [[ -z "$seg" ]] && continue
+    ensure_remote_folder "$part" "$seg"
+    part="$part/$seg"
+  done
+}
+
+# ------------------------------------------------------ deletion tracking ---
+# Relative paths of everything under LOCAL_ROOT that is subject to syncing
+# (excluded paths pruned), sorted for comm(1).
+build_manifest() {
+  local e args=( "(" -path "$STATE_DIR" )
+  for e in "${EXCLUDES[@]}"; do args+=( -o -path "$e" ); done
+  args+=( ")" -prune -o -print )
+  find "$LOCAL_ROOT" "${args[@]}" 2>/dev/null \
+    | awk -v r="$LOCAL_ROOT/" 'index($0, r) == 1 { print substr($0, length(r) + 1) }' \
+    | sort
+}
+
+# Compare the previous pass's manifest with the current local tree; move
+# whatever disappeared locally to the Proton Drive trash (recoverable).
+# Always refreshes the manifest, so turning SYNC_DELETES on later only
+# affects deletions that happen from that point forward.
+propagate_deletions() {
+  local new_manifest
+  new_manifest="$(build_manifest)"
+  if [[ "$SYNC_DELETES" == "true" && -f "$MANIFEST_FILE" ]]; then
+    local rel last=""
+    while IFS= read -r rel; do
+      [[ -z "$rel" ]] && continue
+      # A parent that was already trashed covers its children.
+      [[ -n "$last" && "$rel" == "$last"/* ]] && continue
+      # Safety: never trash something that still exists locally (e.g. a
+      # path that only left the manifest because it is now excluded).
+      [[ -e "$LOCAL_ROOT/$rel" ]] && continue
+      log "trash (deleted locally): $REMOTE_ROOT/$rel"
+      if "$CLI" filesystem trash "$REMOTE_ROOT/$rel" >>"$LOG_FILE" 2>&1; then
+        last="$rel"
+        (( PASS_TRASHED++, TOTAL_TRASHED++ )) || true
+      else
+        log "ERROR: trash failed for $REMOTE_ROOT/$rel (see $LOG_FILE)"
+        (( PASS_ERRORS++, TOTAL_ERRORS++ )) || true
+      fi
+    done < <(comm -23 "$MANIFEST_FILE" <(printf '%s\n' "$new_manifest"))
+  fi
+  printf '%s\n' "$new_manifest" > "$MANIFEST_FILE"
+}
+
+full_sync() {
+  rotate_log
+  PASS_ITEMS=0; PASS_BYTES=0; PASS_ERRORS=0; PASS_SKIPPED=0; PASS_TRASHED=0
+  PASS_STARTED=$(date +%s)
+  write_status syncing
+  log "=== sync pass started (local: $LOCAL_ROOT -> remote: $REMOTE_ROOT) ==="
+  ensure_remote_root
+  # Stamp before syncing so changes made during the pass are caught next round.
+  touch "$STAMP_FILE"
+  sync_dir "$LOCAL_ROOT" "$REMOTE_ROOT"
+  propagate_deletions
+  (( PASSES_DONE++ )) || true
+  append_history
+  log "=== sync pass finished (${PASS_ITEMS} items uploaded, ${PASS_TRASHED} trashed, ${PASS_ERRORS} errors) ==="
+}
+
+# ------------------------------------------------------ change detection ---
+anything_changed() {
+  [[ -f "$STAMP_FILE" ]] || return 0
+  local e first=1 args=( "(" -path "$STATE_DIR" )
+  for e in "${EXCLUDES[@]}"; do
+    args+=( -o -path "$e" )
+  done
+  args+=( ")" -prune -o -newer "$STAMP_FILE" -print -quit )
+  find "$LOCAL_ROOT" "${args[@]}" 2>/dev/null | grep -q .
+}
+
+wait_for_change() {
+  if command -v inotifywait >/dev/null 2>&1; then
+    write_status watching
+    local e regex=""
+    for e in "${EXCLUDES[@]}"; do
+      regex+="${regex:+|}^$(printf '%s' "$e" | sed 's/[.[\*^$()+?{}|]/\\&/g')(/|$)"
+    done
+    if inotifywait -r -qq \
+        -e modify -e create -e delete -e move -e attrib -e close_write \
+        ${regex:+--exclude "$regex"} "$LOCAL_ROOT" 2>>"$LOG_FILE"; then
+      log "change detected (inotify), waiting ${DEBOUNCE}s to settle"
+      write_status debouncing
+      sleep "$DEBOUNCE"
+      return 0
+    fi
+    log "inotifywait failed, falling back to polling for this round"
+  fi
+  write_status polling
+  while ! anything_changed; do sleep "$POLL_INTERVAL"; done
+  log "change detected (poll), waiting ${DEBOUNCE}s to settle"
+  write_status debouncing
+  sleep "$DEBOUNCE"
+}
+
+# ------------------------------------------------------------------ main ---
+main() {
+  exec 9>"$LOCK_FILE"
+  # Wait briefly: on a service restart the previous instance's in-flight
+  # upload child can hold the inherited lock for a few seconds.
+  if ! flock -w "$LOCK_WAIT" 9; then
+    echo "proton-sync-daemon is already running — exiting." >&2
+    exit 0
+  fi
+  echo $$ > "$PID_FILE"
+  trap 'write_status stopped; rm -f "$PID_FILE"' EXIT
+  # killpg/systemd send TERM to the whole group, so children die on their own
+  # and the deferred trap still runs promptly.
+  trap 'exit 0' TERM INT
+
+  if ! CLI="$(find_cli)"; then
+    log "proton-drive binary not found — set PROTON_DRIVE_CLI in $CONFIG_FILE. Exiting."
+    write_status error "proton-drive binary not found"
+    trap - EXIT; rm -f "$PID_FILE"
+    exit 0
+  fi
+
+  if [[ -z "$LOCAL_ROOT" || ! -d "$LOCAL_ROOT" ]]; then
+    log "Not configured yet (LOCAL_ROOT missing) — open the Proton Sync settings app. Exiting."
+    write_status unconfigured
+    trap - EXIT; rm -f "$PID_FILE"
+    exit 0
+  fi
+  [[ -n "$REMOTE_ROOT" ]] || REMOTE_ROOT="/$(basename "$LOCAL_ROOT")"
+  # Proton Drive paths are namespaced; user files live under /my-files.
+  [[ "$REMOTE_ROOT" == /my-files || "$REMOTE_ROOT" == /my-files/* ]] \
+    || REMOTE_ROOT="/my-files$REMOTE_ROOT"
+
+  local check_out
+  if ! check_out="$("$CLI" filesystem list / 2>&1)"; then
+    if [[ "$check_out" == *"You need to login first"* ]]; then
+      log "Not logged in to Proton Drive — run: $CLI auth login. Exiting."
+      write_status logged-out
+    else
+      log "Proton Drive CLI check failed: $check_out. Exiting."
+      write_status error "$check_out"
+    fi
+    trap - EXIT; rm -f "$PID_FILE"
+    exit 0
+  fi
+
+  load_excludes
+
+  if [[ "${1:-}" == "--once" ]]; then
+    full_sync
+    write_status idle
+    trap - EXIT; rm -f "$PID_FILE"
+    exit 0
+  fi
+
+  if ! command -v inotifywait >/dev/null 2>&1; then
+    log "NOTE: inotifywait not found — polling every ${POLL_INTERVAL}s instead."
+  fi
+
+  log "watch mode started (pid $$, watching $LOCAL_ROOT)"
+  full_sync
+  while true; do
+    wait_for_change
+    full_sync
+  done
+}
+
+# Only run when executed directly — the test suite sources this file to
+# unit-test individual functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

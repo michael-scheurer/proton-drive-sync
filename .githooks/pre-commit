@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Runs the secret/personal-data scan on staged files before every commit.
+# Enabled via:  git config core.hooksPath .githooks
+exec "$(dirname "$0")/../tests/check-no-secrets.sh"

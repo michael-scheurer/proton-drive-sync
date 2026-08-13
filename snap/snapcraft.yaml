@@ -1,0 +1,97 @@
+name: proton-sync
+# Before building: place the proton-drive CLI binary at the repo root (it is
+# gitignored — the snap bundles it at build time; check Proton's
+# redistribution terms before publishing the result).
+#
+# Build & smoke test:
+#   snapcraft
+#   sudo snap install --dangerous ./proton-sync_0.2.0_amd64.snap
+#   sudo snap connect proton-sync:password-manager-service   # keyring access
+#   proton-sync.proton-drive auth login   # snap has its own $HOME/session
+#   # launch "Proton Sync", pick a folder, save, toggle background sync on;
+#   # daemon log: ~/snap/proton-sync/current/.local/state/proton-sync/sync.log
+# If the UI fails to start, drop either the gnome extension or the staged
+# GTK packages in parts.deps (one of the two is enough).
+#
+# NOTE: check name availability with `snapcraft register` — and see the
+# trademark note in README.md before publishing under this name.
+title: Proton Sync (Unofficial)
+base: core24
+version: '0.2.0'
+summary: Keep a local folder synced to Proton Drive (unofficial)
+description: |
+  Unofficial one-way synchronisation of a local folder to Proton Drive,
+  built on the Proton Drive CLI/SDK.
+
+  * Pick a folder — it is uploaded to your Proton Drive and kept up to
+    date whenever files change (instant change detection via inotify).
+  * Exclude sub-folders you don't want synced.
+  * Runs quietly in the background, starting automatically at login.
+  * Unchanged files are skipped, changed files are replaced, folders are
+    merged. Local deletions are NOT propagated (your Drive keeps a copy).
+
+  First-time setup: open Proton Sync, then log in once from a terminal:
+
+      proton-sync.proton-drive auth login
+
+  This app is not affiliated with or endorsed by Proton AG.
+license: MIT
+grade: stable
+confinement: strict
+compression: lzo
+
+platforms:
+  amd64:
+
+apps:
+  proton-sync:
+    command: bin/proton-sync-settings
+    extensions: [gnome]
+    plugs:
+      - home
+      - network
+      - removable-media
+      - password-manager-service
+  daemon:
+    command: bin/proton-sync-daemon
+    plugs:
+      - home
+      - network
+      - removable-media
+      - password-manager-service
+    # The settings app writes proton-sync-daemon.desktop into
+    # $SNAP_USER_DATA/.config/autostart when background sync is enabled;
+    # snapd then launches this app at login.
+    autostart: proton-sync-daemon.desktop
+  proton-drive:
+    command: bin/proton-drive
+    plugs:
+      - home
+      - network
+      - removable-media
+      - password-manager-service
+
+parts:
+  app:
+    plugin: dump
+    source: .
+    organize:
+      proton-drive: bin/proton-drive
+    stage:
+      - bin/proton-sync-daemon
+      - bin/proton-sync-settings
+      - bin/proton-drive
+    override-prime: |
+      craftctl default
+      chmod 0755 $CRAFT_PRIME/bin/proton-sync-daemon \
+                 $CRAFT_PRIME/bin/proton-sync-settings \
+                 $CRAFT_PRIME/bin/proton-drive
+
+  deps:
+    plugin: nil
+    stage-packages:
+      - inotify-tools
+      - python3
+      - python3-gi
+      - python3-gi-cairo
+      - gir1.2-gtk-3.0

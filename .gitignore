@@ -1,0 +1,15 @@
+# The Proton Drive CLI binary: >100 MB and not ours to redistribute.
+# See README on where to get it.
+proton-drive
+
+# Local runtime artifacts
+*.log
+*.lock
+__pycache__/
+*.pyc
+
+# Snap build output
+*.snap
+parts/
+stage/
+prime/

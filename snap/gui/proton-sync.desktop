@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Sync
+GenericName=Folder synchronisation
+Comment=Keep a local folder synced to Proton Drive (unofficial)
+Exec=proton-sync
+Icon=${SNAP}/meta/gui/proton-sync.svg
+Terminal=false
+Categories=Utility;Network;FileTransfer;
+Keywords=proton;drive;sync;backup;cloud;
+StartupNotify=true
