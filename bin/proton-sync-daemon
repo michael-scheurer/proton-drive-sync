@@ -4,20 +4,39 @@
 #
 #   proton-sync-daemon           watch mode: sync once, then re-sync whenever
 #                                a change is detected (inotifywait if
-#                                available, polling otherwise)
+#                                available, polling otherwise) or a sync is
+#                                requested (touch $STATE_DIR/trigger/sync-now)
 #   proton-sync-daemon --once    single sync pass, then exit
 #
 # Configuration (created by the Proton Sync settings app):
 #   $XDG_CONFIG_HOME/proton-sync/config          KEY='VALUE' lines, sourced
 #   $XDG_CONFIG_HOME/proton-sync/excludes.list   absolute paths, one per line
 #
-# Config keys: LOCAL_ROOT, REMOTE_ROOT, POLL_INTERVAL, DEBOUNCE,
-#              PROTON_DRIVE_CLI (optional path to the proton-drive binary)
+# Config keys: LOCAL_ROOT, REMOTE_ROOT, POLL_INTERVAL (seconds), DEBOUNCE,
+#              SYNC_DELETES, FULL_CHECK_INTERVAL (seconds between full checks),
+#              PROTON_DRIVE_CLI (path to the proton-drive binary)
+#
+# How a pass decides what to upload (quick passes):
+#   - each top-level entry ("unit") remembers when it was last uploaded
+#     successfully (synced.tsv); nothing newer than that -> skipped
+#   - a few changed items -> only those are uploaded, into their remote
+#     folders; many changes, or an entry never uploaded -> the whole entry
+#   - every FULL_CHECK_INTERVAL seconds (or on request) a full check hands
+#     everything to the CLI again, whose content dedup catches what mtimes
+#     cannot (e.g. files copied with preserved timestamps)
+#   proton-sync-daemon --once --full    one full check, then exit
+#
+# Files written for the settings app, all in $STATE_DIR:
+#   status.json    live state + counters      queue.tsv   upload list of the
+#   history.jsonl  one line per finished pass             current/last pass
+#   events.tsv     live feed: files added/updated/trashed, failures, retries
+#   sync.log       full technical log
 #
 # Behavior notes:
-#   - One-way upload only; local deletions are not propagated.
-#   - Unchanged files are skipped (content dedup by the CLI), changed files
-#     are replaced, folders are merged.
+#   - One-way upload only. Unchanged files are skipped (content dedup by the
+#     CLI), changed files are replaced, folders are merged.
+#   - Local deletions are propagated only when SYNC_DELETES='true', and only
+#     ever to the Proton Drive trash.
 #   - Exits 0 (not an error) when unconfigured or not logged in, so login
 #     managers and systemd don't spin on a setup that isn't finished yet.
 
@@ -35,21 +54,47 @@ STAMP_FILE="$STATE_DIR/last-sync-stamp"
 STATUS_FILE="$STATE_DIR/status.json"
 HISTORY_FILE="$STATE_DIR/history.jsonl"
 MANIFEST_FILE="$STATE_DIR/manifest.txt"
+# Which (local, remote) folder pair the manifest belongs to.
+MANIFEST_ROOTS_FILE="$STATE_DIR/manifest.roots"
+QUEUE_FILE="$STATE_DIR/queue.tsv"
+EVENTS_FILE="$STATE_DIR/events.tsv"
+MAX_EVENTS=3000
+# Stamp of the previous pass: files newer than it count as "updated".
+STAMP_PREV="$STATE_DIR/prev-sync-stamp"
+# How often (s) to sample which file the CLI is reading during a folder upload.
+SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-1}"
+# Per-unit bookkeeping: "<unit path>\t<start time (epoch s) of the pass that
+# last uploaded it successfully>". Whole seconds: portable across find
+# implementations; a file touched in the very second a pass starts is at
+# worst re-checked once.
+SYNCED_FILE="$STATE_DIR/synced.tsv"
+# mtime = when the last full check started.
+FULL_STAMP="$STATE_DIR/last-full-check"
+UNIT_MANIFEST="$STATE_DIR/unit-manifest.tmp"
+# More changed items than this inside one unit -> hand the whole unit to the CLI.
+PARTIAL_MAX="${PARTIAL_MAX:-20}"
+# The settings app creates this file to request a sync pass right away.
+TRIGGER_DIR="$STATE_DIR/trigger"
+TRIGGER_FILE="$TRIGGER_DIR/sync-now"
 MAX_LOG_BYTES=$((5 * 1024 * 1024))
 LOCK_WAIT="${LOCK_WAIT:-30}"
+RETRY_DELAY="${RETRY_DELAY:-5}"
+# How often the poll loop looks for a manual sync request (seconds).
+TRIGGER_TICK="${TRIGGER_TICK:-5}"
 
 # defaults, overridable via config file
 LOCAL_ROOT=""
 REMOTE_ROOT=""
 POLL_INTERVAL=300
 DEBOUNCE=30
+FULL_CHECK_INTERVAL=86400
 PROTON_DRIVE_CLI=""
 # When "true", a file deleted locally is moved to the Proton Drive trash on
 # the next pass (recoverable there). Anything deleted while this was off, or
 # before the first pass recorded it, is never touched.
 SYNC_DELETES=false
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$TRIGGER_DIR"
 # shellcheck disable=SC1090
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
@@ -83,22 +128,43 @@ find_cli() {
 
 # ------------------------------------------------------- status reporting ---
 # The settings app visualizes these. status.json holds the live state,
-# history.jsonl gets one line per completed sync pass.
+# history.jsonl gets one line per completed sync pass, queue.tsv lists the
+# entries of the current (or last) pass with their state.
 PASS_ITEMS=0; PASS_BYTES=0; PASS_ERRORS=0; PASS_SKIPPED=0; PASS_TRASHED=0
 PASS_STARTED=0
 TOTAL_ITEMS=0; TOTAL_BYTES=0; TOTAL_ERRORS=0; TOTAL_TRASHED=0; PASSES_DONE=0
+PASS_MODE=quick       # quick | full
+FORCE_FULL=0          # --full on the command line
+TRIGGER_REQUEST=""    # content of the trigger file ("full" = full check)
 
 json_escape() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
+tsv_field()   { local s="${1//$'\t'/ }"; printf '%s' "${s//$'\n'/ }"; }
 
-write_status() {  # <state> [current item]
+write_status() {  # <state> [current item] [current file inside it]
   {
-    printf '{"state":"%s","ts":%s,"pid":%s' "$1" "$(date +%s)" "$$"
+    printf '{"state":"%s","mode":"%s","ts":%s,"pid":%s' "$1" "$PASS_MODE" "$(date +%s)" "$$"
     printf ',"pass_started":%s,"pass_items":%s,"pass_bytes":%s,"pass_errors":%s,"pass_skipped":%s,"pass_trashed":%s' \
       "$PASS_STARTED" "$PASS_ITEMS" "$PASS_BYTES" "$PASS_ERRORS" "$PASS_SKIPPED" "$PASS_TRASHED"
     printf ',"total_items":%s,"total_bytes":%s,"total_errors":%s,"total_trashed":%s,"passes_done":%s' \
       "$TOTAL_ITEMS" "$TOTAL_BYTES" "$TOTAL_ERRORS" "$TOTAL_TRASHED" "$PASSES_DONE"
-    printf ',"current":"%s"}\n' "$(json_escape "${2:-}")"
+    printf ',"current":"%s","file":"%s"}\n' "$(json_escape "${2:-}")" "$(json_escape "${3:-}")"
   } > "$STATUS_FILE.tmp" && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
+
+# Live feed for the settings app: "<epoch>\t<kind>\t<path>\t<detail>".
+# Kinds: pass-start pass-end uploading done failed retry new updated more
+#        folder trashed trash-failed
+event() {  # <kind> [path] [detail]
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$(tsv_field "${2:-}")" \
+    "$(tsv_field "${3:-}")" >> "$EVENTS_FILE"
+}
+
+trim_events() {
+  [[ -f "$EVENTS_FILE" ]] || return 0
+  if (( $(wc -l < "$EVENTS_FILE") > MAX_EVENTS )); then
+    tail -n $(( MAX_EVENTS * 2 / 3 )) "$EVENTS_FILE" > "$EVENTS_FILE.tmp" \
+      && mv -f "$EVENTS_FILE.tmp" "$EVENTS_FILE"
+  fi
 }
 
 append_history() {
@@ -121,8 +187,33 @@ parse_uploaded() {
        }' <<< "$1"
 }
 
+UNIT_ITEMS=0   # items uploaded for the entry currently being processed
+count_uploaded() {  # <cli output>
+  local items bytes
+  read -r items bytes <<< "$(parse_uploaded "$1")"
+  (( PASS_ITEMS += items, TOTAL_ITEMS += items, UNIT_ITEMS += items )) || true
+  (( PASS_BYTES += bytes, TOTAL_BYTES += bytes )) || true
+}
+
+parse_skipped() { awk '/Skipped:/ { print $2 + 0; exit }' <<< "$1"; }
+
+# One short line explaining a failed upload, for the settings app. Prefers
+# the CLI's per-file "Failed:" entry, then a system error line (ENOENT: ...),
+# then whatever the CLI said last.
+failure_reason() {  # <cli output>
+  local r
+  r="$(awk '/^ *Failed: / { f=1; next } f && /^ *- / { sub(/^ *- /, ""); print; exit }' <<<"$1")"
+  [[ -n "$r" ]] || r="$(grep -m1 -E '^E[A-Z]+: ' <<<"$1")"
+  [[ -n "$r" ]] || r="$(grep -v '^[[:space:]]*$' <<<"$1" | tail -n1)"
+  r="$(tsv_field "$r")"
+  printf '%s' "${r:0:240}"
+}
+
 # --------------------------------------------------------------- helpers ---
 declare -a EXCLUDES=()
+# find(1) arguments that prune the state dir and all excludes:
+#   find ROOT "${PRUNE_ARGS[@]}" <tests> -print
+declare -a PRUNE_ARGS=()
 
 load_excludes() {
   EXCLUDES=()
@@ -133,6 +224,24 @@ load_excludes() {
       EXCLUDES+=( "${line%/}" )
     done < "$EXCLUDES_FILE"
   fi
+  PRUNE_ARGS=( "(" -path "$STATE_DIR" )
+  local e
+  for e in "${EXCLUDES[@]}"; do PRUNE_ARGS+=( -o -path "$e" ); done
+  PRUNE_ARGS+=( ")" -prune -o )
+}
+
+# (Re)read config and excludes. Called at startup and before every pass, so
+# settings saved in the app apply without a service restart.
+load_config() {
+  REMOTE_ROOT=""; POLL_INTERVAL=300; DEBOUNCE=30; SYNC_DELETES=false
+  FULL_CHECK_INTERVAL=86400
+  # shellcheck disable=SC1090
+  [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+  [[ -n "$REMOTE_ROOT" ]] || REMOTE_ROOT="/$(basename "$LOCAL_ROOT")"
+  # Proton Drive paths are namespaced; user files live under /my-files.
+  [[ "$REMOTE_ROOT" == /my-files || "$REMOTE_ROOT" == /my-files/* ]] \
+    || REMOTE_ROOT="/my-files$REMOTE_ROOT"
+  load_excludes
 }
 
 is_excluded() {
@@ -151,35 +260,334 @@ ensure_remote_folder() {  # <remote parent> <name> — ok if it already exists
   "$CLI" filesystem create-folder "$1" "$2" >/dev/null 2>&1 || true
 }
 
-# ------------------------------------------------------------------ sync ---
-sync_dir() {
-  local local_dir="$1" remote_path="$2" entry name out items bytes
+# ------------------------------------------------------------------ plan ---
+# A pass is planned first (which entries get uploaded, in which order), then
+# run. The plan doubles as the queue the settings app shows: queue.tsv has
+# one "<state>\t<local path>\t<note>" line per upload entry.
+#   kind: upload   — hand the entry to the CLI (files, and folders without
+#                    excluded descendants; the CLI merges/replaces inside)
+#         mkdir    — folder with an excluded descendant: create it remotely
+#                    and plan its children individually
+#         skip     — excluded
+declare -a PLAN_KIND=() PLAN_LOCAL=() PLAN_REMOTE=() PLAN_STATE=() PLAN_NOTE=()
+declare -a PLAN_MODE=() PLAN_ITEMS=()   # full|partial|unchanged, partial item list
+declare -A SYNCED_AT=()                 # unit -> start of the pass that last uploaded it
+
+plan_add() {  # <kind> <local> <remote> <state> [mode] [items]
+  PLAN_KIND+=("$1"); PLAN_LOCAL+=("$2"); PLAN_REMOTE+=("$3")
+  PLAN_STATE+=("$4"); PLAN_NOTE+=(""); PLAN_MODE+=("${5:-full}"); PLAN_ITEMS+=("${6:-}")
+}
+
+# ------------------------------------------- what needs uploading (quick) ---
+manifest_valid() {
+  [[ "$(head -n 2 "$MANIFEST_ROOTS_FILE" 2>/dev/null)" == "$LOCAL_ROOT"$'\n'"$REMOTE_ROOT" ]]
+}
+
+load_synced() {
+  SYNCED_AT=()
+  manifest_valid || return 0          # folders changed: everything starts over
+  [[ -f "$SYNCED_FILE" ]] || return 0
+  local path ts
+  while IFS=$'\t' read -r path ts; do
+    [[ -n "$path" && "$ts" =~ ^[0-9]+$ ]] && SYNCED_AT["$path"]="$ts"
+  done < "$SYNCED_FILE"
+}
+
+# Persist SYNCED_AT for the units of the current plan (called after every
+# successful unit, so an interrupted pass resumes where it stopped).
+write_synced() {
+  local i u
+  {
+    for i in "${!PLAN_KIND[@]}"; do
+      u="${PLAN_LOCAL[$i]}"
+      [[ "${PLAN_KIND[$i]}" == upload && -n "${SYNCED_AT[$u]:-}" ]] || continue
+      printf '%s\t%s\n' "$(tsv_field "$u")" "${SYNCED_AT[$u]}"
+    done
+  } > "$SYNCED_FILE.tmp" && mv -f "$SYNCED_FILE.tmp" "$SYNCED_FILE"
+}
+
+full_check_due() {
+  (( FULL_CHECK_INTERVAL <= 0 )) && return 0
+  [[ -f "$FULL_STAMP" ]] || return 0
+  local last
+  last="$(stat -c %Y "$FULL_STAMP" 2>/dev/null || echo 0)"
+  (( $(date +%s) - last >= FULL_CHECK_INTERVAL ))
+}
+
+# Was <abs path> part of the previous pass (so it exists remotely)?
+in_manifest() {
+  grep -qxF -- "${1#"$LOCAL_ROOT"/}" "$UNIT_MANIFEST" 2>/dev/null
+}
+
+# <path>, or its highest ancestor below <unit> that the remote does not know
+# yet — that ancestor is what gets uploaded (wholesale).
+unknown_ancestor() {  # <path> <unit>
+  local p="$1" parent
+  while :; do
+    parent="$(dirname "$p")"
+    [[ "$parent" == "$2" ]] && break
+    in_manifest "$parent" && break
+    p="$parent"
+  done
+  printf '%s' "$p"
+}
+
+# Sets UNIT_MODE (full|partial|unchanged) and, for partial, PARTIAL_LIST
+# (one local path per line, each uploaded into its remote parent folder).
+decide_unit() {  # <local entry>
+  UNIT_MODE=full; PARTIAL_LIST=""
+  [[ "$PASS_MODE" == full ]] && return 0
+  local since="${SYNCED_AT[$1]:-}"
+  [[ -n "$since" ]] || return 0                      # never uploaded
+  local changed
+  changed="$(find "$1" "${PRUNE_ARGS[@]}" -newermt "@$since" -print 2>/dev/null)"
+  if [[ -z "$changed" ]]; then UNIT_MODE=unchanged; return 0; fi
+  [[ -d "$1" ]] || return 0                          # a changed file: re-upload it
+  local rel="${1#"$LOCAL_ROOT"/}"
+  awk -v p="$rel" 'index($0, p "/") == 1 || $0 == p' "$MANIFEST_FILE" 2>/dev/null > "$UNIT_MANIFEST"
+  local -A items=()
+  local p c
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    if [[ -d "$p" ]]; then
+      # a folder's mtime changed: something was added, removed or renamed in
+      # it; what the remote does not know yet has to be uploaded
+      for c in "$p"/* "$p"/.[!.]* "$p"/..?*; do
+        [[ -e "$c" || -L "$c" ]] || continue
+        is_excluded "$c" && continue
+        in_manifest "$c" || items["$(unknown_ancestor "$c" "$1")"]=1
+      done
+    else
+      items["$(unknown_ancestor "$p" "$1")"]=1
+    fi
+    (( ${#items[@]} > PARTIAL_MAX )) && return 0     # too many: whole unit
+  done <<< "$changed"
+  if (( ${#items[@]} == 0 )); then UNIT_MODE=unchanged; return 0; fi   # e.g. only deletions
+  PARTIAL_LIST="$(printf '%s\n' "${!items[@]}" | LC_ALL=C sort)"
+  UNIT_MODE=partial
+}
+
+plan_dir() {  # <local dir> <remote path>
+  local local_dir="$1" remote_path="$2" entry name
   while IFS= read -r -d '' entry; do
     name="$(basename "$entry")"
     if is_excluded "$entry"; then
-      log "skip (excluded): $entry"
-      (( PASS_SKIPPED++ )) || true
-      continue
-    fi
-    if [[ -d "$entry" ]] && has_excluded_inside "$entry"; then
-      ensure_remote_folder "$remote_path" "$name"
-      sync_dir "$entry" "$remote_path/$name"
+      plan_add skip "$entry" "" skipped
+    elif [[ -d "$entry" ]] && has_excluded_inside "$entry"; then
+      plan_add mkdir "$entry" "$remote_path" -
+      plan_dir "$entry" "$remote_path/$name"
     else
-      log "upload: $entry  ->  $remote_path/"
-      write_status syncing "$entry"
-      if out="$("$CLI" filesystem upload -d merge -f replace "$entry" "$remote_path" 2>&1)"; then
-        printf '%s\n' "$out" >> "$LOG_FILE"
-        read -r items bytes <<< "$(parse_uploaded "$out")"
-        (( PASS_ITEMS += items, TOTAL_ITEMS += items )) || true
-        (( PASS_BYTES += bytes, TOTAL_BYTES += bytes )) || true
+      decide_unit "$entry"
+      if [[ "$UNIT_MODE" == unchanged ]]; then
+        plan_add upload "$entry" "$remote_path" unchanged unchanged
       else
-        printf '%s\n' "$out" >> "$LOG_FILE"
-        log "ERROR: upload failed for $entry (see $LOG_FILE)"
-        (( PASS_ERRORS++, TOTAL_ERRORS++ )) || true
+        plan_add upload "$entry" "$remote_path" pending "$UNIT_MODE" "$PARTIAL_LIST"
       fi
-      write_status syncing "$entry"
     fi
   done < <(find "$local_dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+}
+
+write_queue() {
+  local i
+  {
+    for i in "${!PLAN_KIND[@]}"; do
+      [[ "${PLAN_KIND[$i]}" == upload ]] || continue
+      printf '%s\t%s\t%s\n' "${PLAN_STATE[$i]}" "$(tsv_field "${PLAN_LOCAL[$i]}")" "${PLAN_NOTE[$i]}"
+    done
+  } > "$QUEUE_FILE.tmp" && mv -f "$QUEUE_FILE.tmp" "$QUEUE_FILE"
+}
+
+# The regular file under LOCAL_ROOT that process $1 currently has open, if any.
+current_open_file() {
+  local l t
+  for l in /proc/"$1"/fd/*; do
+    t="$(readlink "$l" 2>/dev/null)" || continue
+    if [[ "$t" == "$LOCAL_ROOT"/* && -f "$t" ]]; then
+      printf '%s' "$t"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Run one CLI upload. For folders the CLI runs in the background and we
+# sample which local file it is reading, so the app can show it live (the
+# CLI itself never prints file names while it works). Sets UPLOAD_OUT.
+run_cli_upload() {  # <local entry> <cli args...>
+  local entry="$1"; shift
+  if [[ ! -d "$entry" ]]; then
+    UPLOAD_OUT="$("$CLI" "$@" 2>&1)"
+    return $?
+  fi
+  local tmp="$STATE_DIR/upload.out" pid rc f last=""
+  "$CLI" "$@" > "$tmp" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if f="$(current_open_file "$pid")" && [[ "$f" != "$last" ]]; then
+      last="$f"
+      write_status syncing "$entry" "$f"
+    fi
+    sleep "$SAMPLE_INTERVAL"
+  done
+  wait "$pid"; rc=$?
+  UPLOAD_OUT="$(cat "$tmp" 2>/dev/null)"
+  rm -f "$tmp"
+  return $rc
+}
+
+# Which files in an entry are new or updated, as "<new|updated>\t<path>"
+# lines. The CLI only names the files it skipped, so this is derived
+# locally: not in the previous pass's manifest -> new; modified since that
+# pass -> updated. Computed before the upload (so the feed can announce
+# "12 new · 3 updated" right away) and replayed as events after it.
+changed_files() {  # <local entry>
+  local entry="$1" rel="${1#"$LOCAL_ROOT"/}" now old=""
+  now="$(find "$entry" -type f -print 2>/dev/null | LC_ALL=C sort)"
+  [[ -n "$now" ]] || return 0
+  if [[ "$(head -n 2 "$MANIFEST_ROOTS_FILE" 2>/dev/null)" == "$LOCAL_ROOT"$'\n'"$REMOTE_ROOT" ]]; then
+    old="$(awk -v r="$LOCAL_ROOT/" -v p="$rel" 'index($0, p "/") == 1 || $0 == p { print r $0 }' \
+           "$MANIFEST_FILE" 2>/dev/null | LC_ALL=C sort)"
+  fi
+  comm -13 <(printf '%s\n' "$old") <(printf '%s\n' "$now") | grep -v '^$' | sed 's/^/new\t/'
+  if [[ -n "$old" && -f "$STAMP_PREV" ]]; then
+    comm -12 <(comm -12 <(printf '%s\n' "$old") <(printf '%s\n' "$now")) \
+             <(find "$entry" -type f -newer "$STAMP_PREV" 2>/dev/null | LC_ALL=C sort) \
+      | grep -v '^$' | sed 's/^/updated\t/'
+  fi
+  return 0
+}
+
+describe_changes() {  # <changed_files output> -> "12 new · 3 updated" (or "")
+  local n u out=""
+  n="$(grep -c $'^new\t' <<< "$1")"; u="$(grep -c $'^updated\t' <<< "$1")"
+  (( n > 0 )) && out="$n new"
+  (( u > 0 )) && out="${out:+$out · }$u updated"
+  printf '%s' "$out"
+}
+
+# Replay the changed-files list as events, capped so a first full upload
+# does not flood the feed.
+emit_file_events() {  # <changed_files output> <local entry>
+  local line total=0 cap=500
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    (( total++ ))
+    (( total <= cap )) && event "${line%%$'\t'*}" "${line#*$'\t'}"
+  done <<< "$1"
+  (( total > cap )) && event more "$2" "$(( total - cap )) more files"
+  return 0
+}
+
+# Upload one entry; sets UPLOAD_OUT to the CLI output of the last attempt.
+# Retries once for the two failure classes known to be transient or fixable:
+#   * thumbnail generation failed (TIFF, macOS "._" files, ...) — the CLI
+#     refuses the whole entry; retry without thumbnails so the files still
+#     get backed up
+#   * a file changed or vanished mid-upload (ENOENT) — retry after a pause
+# Files uploaded before a failure are real uploads and are counted.
+upload_entry() {  # <local entry> <remote parent>
+  local -a extra=()
+  local attempt
+  UNIT_ITEMS=0
+  for attempt in 1 2; do
+    if run_cli_upload "$1" filesystem upload -d merge -f replace ${extra[@]+"${extra[@]}"} "$1" "$2"; then
+      printf '%s\n' "$UPLOAD_OUT" >> "$LOG_FILE"
+      count_uploaded "$UPLOAD_OUT"
+      return 0
+    fi
+    printf '%s\n' "$UPLOAD_OUT" >> "$LOG_FILE"
+    count_uploaded "$UPLOAD_OUT"
+    (( attempt == 1 )) || break
+    if [[ "$UPLOAD_OUT" == *"--skip-thumbnails"* ]]; then
+      log "retrying without thumbnails: $1"
+      event retry "$1" "some images could not get previews, retrying without"
+      extra=(--skip-thumbnails)
+    elif [[ "$UPLOAD_OUT" == *ENOENT* ]]; then
+      log "a file changed or vanished during the upload, retrying in ${RETRY_DELAY}s: $1"
+      event retry "$1" "a file changed while uploading, retrying"
+      sleep "$RETRY_DELAY"
+    else
+      break
+    fi
+  done
+  return 1
+}
+
+# Upload only the changed items of a unit, each into its remote parent.
+# Any failure -> caller falls back to uploading the whole unit.
+upload_partial() {  # <unit> <item list>
+  local item rel parent_rel remote_parent
+  UNIT_ITEMS=0
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    rel="${item#"$LOCAL_ROOT"/}"
+    parent_rel="$(dirname "$rel")"
+    remote_parent="$REMOTE_ROOT"
+    [[ "$parent_rel" != . ]] && remote_parent="$REMOTE_ROOT/$parent_rel"
+    log "upload (changed): $item  ->  $remote_parent/"
+    write_status syncing "$1" "$item"
+    if run_cli_upload "$item" filesystem upload -d merge -f replace "$item" "$remote_parent"; then
+      printf '%s\n' "$UPLOAD_OUT" >> "$LOG_FILE"
+      count_uploaded "$UPLOAD_OUT"
+    else
+      printf '%s\n' "$UPLOAD_OUT" >> "$LOG_FILE"
+      log "changed-item upload failed for $item — uploading the whole entry instead"
+      return 1
+    fi
+  done <<< "$2"
+  return 0
+}
+
+run_plan() {
+  local i entry changes mode ok
+  for i in "${!PLAN_KIND[@]}"; do
+    entry="${PLAN_LOCAL[$i]}"
+    case "${PLAN_KIND[$i]}" in
+      skip)
+        log "skip (excluded): $entry"
+        (( PASS_SKIPPED++ )) || true
+        ;;
+      mkdir)
+        ensure_remote_folder "${PLAN_REMOTE[$i]}" "$(basename "$entry")"
+        event folder "$entry"
+        ;;
+      upload)
+        mode="${PLAN_MODE[$i]}"
+        [[ "$mode" == unchanged ]] && continue        # nothing newer than last upload
+        PLAN_STATE[$i]=uploading; write_queue
+        log "upload ($mode): $entry  ->  ${PLAN_REMOTE[$i]}/"
+        write_status syncing "$entry"
+        changes="$(changed_files "$entry")"
+        event uploading "$entry" "$(describe_changes "$changes")"
+        ok=0
+        if [[ "$mode" == partial ]]; then
+          upload_partial "$entry" "${PLAN_ITEMS[$i]}" && ok=1 || mode=full
+        fi
+        if [[ "$mode" == full ]]; then
+          upload_entry "$entry" "${PLAN_REMOTE[$i]}" && ok=1
+        fi
+        if (( ok )); then
+          PLAN_STATE[$i]=done
+          SYNCED_AT["$entry"]="$PASS_STARTED"
+          write_synced
+          (( UNIT_ITEMS > 0 )) && emit_file_events "$changes" "$entry"
+          if (( UNIT_ITEMS > 0 )); then
+            event done "$entry" "$UNIT_ITEMS uploaded · $(parse_skipped "$UPLOAD_OUT") unchanged"
+          else
+            event done "$entry" "nothing new"
+          fi
+        else
+          PLAN_STATE[$i]=failed
+          PLAN_NOTE[$i]="$(failure_reason "$UPLOAD_OUT")"
+          log "ERROR: upload failed for $entry (see $LOG_FILE)"
+          event failed "$entry" "${PLAN_NOTE[$i]}"
+          (( PASS_ERRORS++, TOTAL_ERRORS++ )) || true
+        fi
+        write_queue
+        write_status syncing "$entry"
+        ;;
+    esac
+  done
 }
 
 # Create every folder of REMOTE_ROOT below /my-files ("/my-files/a/b" ->
@@ -212,10 +620,25 @@ build_manifest() {
 # whatever disappeared locally to the Proton Drive trash (recoverable).
 # Always refreshes the manifest, so turning SYNC_DELETES on later only
 # affects deletions that happen from that point forward.
+# Filesystem id of a path (overridable for the tests).
+fs_id() { printf '%s' "${FS_ID_OVERRIDE:-$(stat -c %d "$1" 2>/dev/null || echo '?')}"; }
+
 propagate_deletions() {
-  local new_manifest
+  local new_manifest pair roots old_roots
+  pair="$LOCAL_ROOT"$'\n'"$REMOTE_ROOT"
+  roots="$pair"$'\n'"$(fs_id "$LOCAL_ROOT")"
   new_manifest="$(build_manifest)"
   if [[ "$SYNC_DELETES" == "true" && -f "$MANIFEST_FILE" ]]; then
+    old_roots="$(cat "$MANIFEST_ROOTS_FILE" 2>/dev/null)"
+    if [[ "$old_roots" != "$roots" ]]; then
+      if [[ "${old_roots%$'\n'*}" == "$pair" && -z "$new_manifest" ]]; then
+        # Same folders, but now empty and on another filesystem: that is an
+        # unplugged drive, not a deletion. Keep the manifest for its return.
+        log "WARNING: sync folder is empty and on another filesystem than before (drive unplugged?) — nothing is trashed"
+        return 0
+      fi
+      log "sync folders changed since the last pass — deletion tracking starts fresh, nothing is trashed"
+    else
     local rel last=""
     while IFS= read -r rel; do
       [[ -z "$rel" ]] && continue
@@ -225,38 +648,97 @@ propagate_deletions() {
       # path that only left the manifest because it is now excluded).
       [[ -e "$LOCAL_ROOT/$rel" ]] && continue
       log "trash (deleted locally): $REMOTE_ROOT/$rel"
-      if "$CLI" filesystem trash "$REMOTE_ROOT/$rel" >>"$LOG_FILE" 2>&1; then
+      local out
+      if out="$("$CLI" filesystem trash "$REMOTE_ROOT/$rel" 2>&1)"; then
+        printf '%s\n' "$out" >> "$LOG_FILE"
         last="$rel"
         (( PASS_TRASHED++, TOTAL_TRASHED++ )) || true
+        event trashed "$LOCAL_ROOT/$rel" ""
+      elif [[ "$out" == *"Node not found"* ]]; then
+        # Deleted in Proton Drive already (e.g. by hand): nothing to do, and
+        # its children are gone with it.
+        printf '%s\n' "$out" >> "$LOG_FILE"
+        log "already gone from Proton Drive: $REMOTE_ROOT/$rel"
+        last="$rel"
+        event trashed "$LOCAL_ROOT/$rel" "was already gone from Proton Drive"
       else
+        printf '%s\n' "$out" >> "$LOG_FILE"
         log "ERROR: trash failed for $REMOTE_ROOT/$rel (see $LOG_FILE)"
+        event trash-failed "$LOCAL_ROOT/$rel" "$REMOTE_ROOT/$rel"
         (( PASS_ERRORS++, TOTAL_ERRORS++ )) || true
       fi
     done < <(comm -23 "$MANIFEST_FILE" <(printf '%s\n' "$new_manifest"))
+    fi
   fi
   printf '%s\n' "$new_manifest" > "$MANIFEST_FILE"
+  printf '%s\n' "$roots" > "$MANIFEST_ROOTS_FILE"
 }
 
-full_sync() {
+full_sync() {  # returns 1 when the pass was skipped
+  load_config
+  if [[ -z "$LOCAL_ROOT" || ! -d "$LOCAL_ROOT" ]]; then
+    # Unplugged drive, renamed folder: an empty tree must never be mistaken
+    # for "everything was deleted". Upload nothing, trash nothing.
+    log "sync folder not found: $LOCAL_ROOT — skipping this pass"
+    write_status error "Sync folder not found: $LOCAL_ROOT"
+    return 1
+  fi
   rotate_log
+  # A pass satisfies any sync request made before it started; a request
+  # for a full check (trigger file content "full") is honoured here.
+  local request="$TRIGGER_REQUEST"
+  [[ -e "$TRIGGER_FILE" ]] && request="$(cat "$TRIGGER_FILE" 2>/dev/null)"
+  TRIGGER_REQUEST=""
+  rm -f "$TRIGGER_FILE"
+  # Bind manifest + bookkeeping to the current folder pair right away, so an
+  # interrupted pass can resume. A changed pair starts both from scratch.
+  local fresh=0
+  if ! manifest_valid; then
+    if [[ -f "$MANIFEST_ROOTS_FILE" ]]; then
+      log "sync folders changed since the last pass — deletion tracking starts fresh, nothing is trashed"
+    elif [[ -f "$MANIFEST_FILE" ]]; then
+      log "no record of which folders the previous manifest belongs to — deletion tracking starts fresh, nothing is trashed"
+    fi
+    rm -f "$MANIFEST_FILE" "$SYNCED_FILE"
+    printf '%s\n' "$LOCAL_ROOT" "$REMOTE_ROOT" "$(fs_id "$LOCAL_ROOT")" > "$MANIFEST_ROOTS_FILE"
+    fresh=1
+  fi
+  load_synced
+  PASS_MODE=quick
+  if (( FORCE_FULL || fresh )) || [[ "$request" == full ]] || full_check_due \
+     || [[ ! -f "$SYNCED_FILE" ]]; then
+    PASS_MODE=full
+    touch "$FULL_STAMP"
+  fi
   PASS_ITEMS=0; PASS_BYTES=0; PASS_ERRORS=0; PASS_SKIPPED=0; PASS_TRASHED=0
   PASS_STARTED=$(date +%s)
   write_status syncing
-  log "=== sync pass started (local: $LOCAL_ROOT -> remote: $REMOTE_ROOT) ==="
+  log "=== sync pass started [$PASS_MODE] (local: $LOCAL_ROOT -> remote: $REMOTE_ROOT) ==="
+  event pass-start "" "$PASS_MODE"
   ensure_remote_root
-  # Stamp before syncing so changes made during the pass are caught next round.
+  # Keep the previous stamp (for "updated since last pass"), then stamp
+  # before syncing so changes made during the pass are caught next round.
+  [[ -f "$STAMP_FILE" ]] && cp -p "$STAMP_FILE" "$STAMP_PREV"
   touch "$STAMP_FILE"
-  sync_dir "$LOCAL_ROOT" "$REMOTE_ROOT"
+  PLAN_KIND=(); PLAN_LOCAL=(); PLAN_REMOTE=(); PLAN_STATE=(); PLAN_NOTE=()
+  PLAN_MODE=(); PLAN_ITEMS=()
+  plan_dir "$LOCAL_ROOT" "$REMOTE_ROOT"
+  write_queue
+  run_plan
   propagate_deletions
+  write_synced
+  rm -f "$UNIT_MANIFEST"
   (( PASSES_DONE++ )) || true
   append_history
+  event pass-end "" "${PASS_ITEMS} uploaded · ${PASS_TRASHED} moved to trash · ${PASS_ERRORS} problems"
+  trim_events
   log "=== sync pass finished (${PASS_ITEMS} items uploaded, ${PASS_TRASHED} trashed, ${PASS_ERRORS} errors) ==="
 }
 
 # ------------------------------------------------------ change detection ---
 anything_changed() {
   [[ -f "$STAMP_FILE" ]] || return 0
-  local e first=1 args=( "(" -path "$STATE_DIR" )
+  local e args=( "(" -path "$STATE_DIR" )
   for e in "${EXCLUDES[@]}"; do
     args+=( -o -path "$e" )
   done
@@ -264,28 +746,103 @@ anything_changed() {
   find "$LOCAL_ROOT" "${args[@]}" 2>/dev/null | grep -q .
 }
 
+# True (and the request consumed) when the settings app asked for a sync.
+consume_trigger() {
+  [[ -e "$TRIGGER_FILE" ]] || return 1
+  TRIGGER_REQUEST="$(cat "$TRIGGER_FILE" 2>/dev/null)"
+  rm -f "$TRIGGER_FILE"
+  return 0
+}
+
+# Seconds until the next full check is due (>= 1), or 0 for "never".
+full_check_wait() {
+  (( FULL_CHECK_INTERVAL > 0 )) || { printf 0; return; }
+  [[ -f "$FULL_STAMP" ]] || { printf 1; return; }
+  local w=$(( $(stat -c %Y "$FULL_STAMP") + FULL_CHECK_INTERVAL - $(date +%s) ))
+  (( w < 1 )) && w=1
+  printf '%s' "$w"
+}
+
+settle() {
+  write_status debouncing
+  sleep "$DEBOUNCE"
+}
+
 wait_for_change() {
+  if [[ ! -d "$LOCAL_ROOT" ]]; then
+    # Keep the "folder not found" status; sync as soon as it is back, or
+    # when the app asks (e.g. after another folder was chosen).
+    while [[ ! -d "$LOCAL_ROOT" ]]; do
+      consume_trigger && return 0
+      sleep "$TRIGGER_TICK"
+    done
+    log "sync folder is back: $LOCAL_ROOT"
+    return 0
+  fi
+  # Anything that piled up while the last pass ran: a manual request, or
+  # edits made during the pass (inotify wasn't listening then).
+  if consume_trigger; then
+    log "sync requested manually"
+    return 0
+  fi
+  if anything_changed; then
+    log "changes made during the last pass, waiting ${DEBOUNCE}s to settle"
+    settle
+    return 0
+  fi
+  if full_check_due; then
+    log "full check due"
+    return 0
+  fi
+
   if command -v inotifywait >/dev/null 2>&1; then
     write_status watching
-    local e regex=""
+    local e regex="" hit rc tmo
+    tmo="$(full_check_wait)"
     for e in "${EXCLUDES[@]}"; do
       regex+="${regex:+|}^$(printf '%s' "$e" | sed 's/[.[\*^$()+?{}|]/\\&/g')(/|$)"
     done
-    if inotifywait -r -qq \
+    hit="$(inotifywait -r -q --format '%w%f' ${tmo:+-t "$tmo"} \
         -e modify -e create -e delete -e move -e attrib -e close_write \
-        ${regex:+--exclude "$regex"} "$LOCAL_ROOT" 2>>"$LOG_FILE"; then
+        ${regex:+--exclude "$regex"} "$LOCAL_ROOT" "$TRIGGER_DIR" 2>>"$LOG_FILE")"
+    rc=$?
+    if (( rc == 0 )); then
+      if [[ "$hit" == "$TRIGGER_DIR"/* ]]; then
+        consume_trigger
+        log "sync requested manually"
+        return 0
+      fi
       log "change detected (inotify), waiting ${DEBOUNCE}s to settle"
-      write_status debouncing
-      sleep "$DEBOUNCE"
+      settle
+      return 0
+    elif (( rc == 2 )); then
+      log "full check due"
       return 0
     fi
     log "inotifywait failed, falling back to polling for this round"
   fi
+
   write_status polling
-  while ! anything_changed; do sleep "$POLL_INTERVAL"; done
+  local tick="$TRIGGER_TICK" waited="$POLL_INTERVAL"
+  (( tick > POLL_INTERVAL )) && tick="$POLL_INTERVAL"
+  while true; do
+    if consume_trigger; then
+      log "sync requested manually"
+      return 0
+    fi
+    if full_check_due; then
+      log "full check due"
+      return 0
+    fi
+    if (( waited >= POLL_INTERVAL )); then
+      waited=0
+      anything_changed && break
+    fi
+    sleep "$tick"
+    (( waited += tick ))
+  done
   log "change detected (poll), waiting ${DEBOUNCE}s to settle"
-  write_status debouncing
-  sleep "$DEBOUNCE"
+  settle
 }
 
 # ------------------------------------------------------------------ main ---
@@ -310,16 +867,21 @@ main() {
     exit 0
   fi
 
-  if [[ -z "$LOCAL_ROOT" || ! -d "$LOCAL_ROOT" ]]; then
+  if [[ -z "$LOCAL_ROOT" ]]; then
     log "Not configured yet (LOCAL_ROOT missing) — open the Proton Sync settings app. Exiting."
     write_status unconfigured
     trap - EXIT; rm -f "$PID_FILE"
     exit 0
   fi
-  [[ -n "$REMOTE_ROOT" ]] || REMOTE_ROOT="/$(basename "$LOCAL_ROOT")"
-  # Proton Drive paths are namespaced; user files live under /my-files.
-  [[ "$REMOTE_ROOT" == /my-files || "$REMOTE_ROOT" == /my-files/* ]] \
-    || REMOTE_ROOT="/my-files$REMOTE_ROOT"
+  if [[ ! -d "$LOCAL_ROOT" ]]; then
+    # systemd retries every RestartSec, so an unplugged drive is picked up
+    # once it is back.
+    log "sync folder not found: $LOCAL_ROOT. Exiting."
+    write_status error "Sync folder not found: $LOCAL_ROOT"
+    trap - EXIT; rm -f "$PID_FILE"
+    exit 0
+  fi
+  load_config
 
   local check_out
   if ! check_out="$("$CLI" filesystem list / 2>&1)"; then
@@ -334,11 +896,17 @@ main() {
     exit 0
   fi
 
-  load_excludes
-
-  if [[ "${1:-}" == "--once" ]]; then
-    full_sync
-    write_status idle
+  local a once=0
+  for a in "$@"; do
+    case "$a" in
+      --once) once=1 ;;
+      --full) FORCE_FULL=1 ;;
+    esac
+  done
+  if (( once )); then
+    if full_sync; then
+      write_status idle
+    fi
     trap - EXIT; rm -f "$PID_FILE"
     exit 0
   fi
@@ -351,7 +919,7 @@ main() {
   full_sync
   while true; do
     wait_for_change
-    full_sync
+    full_sync || true
   done
 }
 

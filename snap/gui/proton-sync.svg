@@ -1,31 +1,36 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#8a6cff"/>
       <stop offset="1" stop-color="#5230d6"/>
     </linearGradient>
-    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+    <!-- userSpaceOnUse so the gradient is continuous across the cloud's lobes -->
+    <linearGradient id="cloud" gradientUnits="userSpaceOnUse" x1="0" y1="60" x2="0" y2="172">
       <stop offset="0" stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#e6e0ff"/>
+      <stop offset="1" stop-color="#ebe6ff"/>
     </linearGradient>
+    <!-- cloud = three lobes on a flat base -->
+    <g id="cloud-shape">
+      <circle cx="73" cy="142" r="30"/>
+      <circle cx="113" cy="112" r="52"/>
+      <circle cx="171" cy="130" r="42"/>
+      <rect x="73" y="142" width="98" height="30"/>
+    </g>
+    <!-- one sync arrow: arc + head whose direction follows the arc's end tangent -->
+    <g id="arrow">
+      <path d="M103.43 104.79 A30 30 0 0 1 156.98 114.24" fill="none" stroke="#5230d6" stroke-width="11" stroke-linecap="round"/>
+      <path d="M161.12 129.69 L169.02 108.94 L143.9 115.67 Z" fill="#5230d6" stroke="#5230d6" stroke-width="3" stroke-linejoin="round"/>
+    </g>
   </defs>
   <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
-  <!-- cloud -->
-  <path fill="url(#cloud)" d="M78 156
-    a30 30 0 0 1 3-59.8
-    a44 44 0 0 1 85-9.2
-    a34 34 0 0 1 12 66.4
-    a30 30 0 0 1 -8 2.6
-    H86
-    a30 30 0 0 1 -8 0z"/>
-  <!-- sync arrows -->
-  <g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round">
-    <path d="M96 186 a34 34 0 0 1 58 -14"/>
-    <path d="M160 214 a34 34 0 0 1 -58 -14"/>
-  </g>
-  <g fill="#ffffff">
-    <path d="M158 152 l14 26 -30 2 z"/>
-    <path d="M98 234 l-14 -26 30 -2 z"/>
+  <g transform="translate(0 6)">
+    <!-- soft shadow under the cloud -->
+    <use xlink:href="#cloud-shape" fill="#2a1580" opacity="0.28" transform="translate(0 6)"/>
+    <!-- cloud -->
+    <use xlink:href="#cloud-shape" fill="url(#cloud)"/>
+    <!-- sync arrows, laid over the cloud; second arrow is the first rotated 180° -->
+    <use xlink:href="#arrow"/>
+    <use xlink:href="#arrow" transform="rotate(180 128 122)"/>
   </g>
 </svg>

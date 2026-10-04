@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Proton Sync (unofficial) — settings + live sync activity UI.
+"""Proton Sync (unofficial) — settings + activity UI.
 
-Settings page edits the config consumed by proton-sync-daemon and manages the
-background service (systemd user unit outside a snap, snap autostart inside
-one). Activity page visualizes the daemon's status.json / history.jsonl.
+Settings page edits the config consumed by proton-sync-daemon and manages
+the background service (systemd user unit outside a snap, snap autostart
+inside one). Activity page turns the daemon's status.json / queue.tsv /
+history.jsonl into something a non-technical user can read: live state,
+health checks, problems with suggested fixes, the upload queue and, folded
+away, the raw log.
 """
 
 import fcntl
@@ -20,7 +23,8 @@ import time
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 # The pass chart needs the GTK<->cairo bridge (python3-gi-cairo). Everything
 # else on the Activity page works without it.
@@ -34,6 +38,7 @@ except ImportError:
 # a terminal whose environment belongs to another snap, e.g. VS Code).
 _snap = os.environ.get("SNAP", "")
 IS_SNAP = bool(_snap) and os.path.abspath(__file__).startswith(_snap + os.sep)
+SNAP_NAME = os.environ.get("SNAP_NAME", "proton-sync")
 
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "proton-sync")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
@@ -47,6 +52,10 @@ LOCK_FILE = os.path.join(STATE_DIR, "daemon.lock")
 PID_FILE = os.path.join(STATE_DIR, "daemon.pid")
 STATUS_FILE = os.path.join(STATE_DIR, "status.json")
 HISTORY_FILE = os.path.join(STATE_DIR, "history.jsonl")
+QUEUE_FILE = os.path.join(STATE_DIR, "queue.tsv")
+EVENTS_FILE = os.path.join(STATE_DIR, "events.tsv")
+# Creating this file asks a running daemon for a sync pass right away.
+TRIGGER_FILE = os.path.join(STATE_DIR, "trigger", "sync-now")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEMD_UNIT = os.path.expanduser("~/.config/systemd/user/proton-sync.service")
 SNAP_AUTOSTART = os.path.join(
@@ -56,18 +65,46 @@ SNAP_AUTOSTART = os.path.join(
 
 BAR_COLOR = (0x6D / 255, 0x4A / 255, 0xFF / 255)  # #6d4aff, validated
 CHART_PASSES = 24
+POLL_DEFAULT_SECONDS = 300
+FULL_CHECK_DEFAULT_SECONDS = 86400
+MAX_PROBLEM_ROWS = 8
+LIVE_EVENTS = 400
 
 STATE_TEXT = {
     "syncing":      ("#6d4aff", "Syncing"),
-    "debouncing":   ("#6d4aff", "Change detected — waiting for files to settle"),
-    "watching":     ("#2f9e44", "Watching for changes (instant)"),
-    "polling":      ("#2f9e44", "Watching for changes (periodic check)"),
-    "idle":         ("#868e96", "Idle — manual sync finished"),
-    "stopped":      ("#868e96", "Stopped"),
+    "debouncing":   ("#6d4aff", "Changes detected"),
+    "watching":     ("#2f9e44", "Up to date, watching for changes"),
+    "polling":      ("#2f9e44", "Up to date, checking for changes periodically"),
+    "idle":         ("#868e96", "Manual sync finished"),
+    "stopped":      ("#868e96", "Not running"),
     "logged-out":   ("#e8590c", "Not logged in to Proton Drive"),
-    "unconfigured": ("#e8590c", "Not configured yet — save your settings"),
-    "error":        ("#e03131", "Error"),
+    "unconfigured": ("#e8590c", "Not set up yet"),
+    "error":        ("#e03131", "Sync paused because of a problem"),
 }
+ACTIVE_STATES = ("syncing", "debouncing", "watching", "polling")
+BUSY_STATES = ("syncing", "debouncing")
+
+# Glyph + color per severity, shared by checks, problems and the file list.
+GLYPHS = {
+    "ok":      ("#2f9e44", "✓"),
+    "fail":    ("#e03131", "✗"),
+    "warn":    ("#e8590c", "⚠"),
+    "off":     ("#868e96", "–"),
+    "pending": ("#868e96", "…"),
+    "busy":    ("#6d4aff", "●"),
+    "queued":  ("#868e96", "○"),
+    "added":   ("#2f9e44", "+"),
+    "updated": ("#1c7ed6", "↑"),
+    "unchanged": ("#adb5bd", "✓"),
+}
+QUEUE_STATES = ("pending", "uploading", "done", "failed", "unchanged")
+# Live-feed kinds the daemon writes to events.tsv (a test cross-checks them).
+EVENT_KINDS = ("pass-start", "pass-end", "uploading", "done", "failed", "retry",
+               "new", "updated", "more", "folder", "trashed", "trash-failed")
+
+
+def esc(text):
+    return GLib.markup_escape_text(str(text if text is not None else ""))
 
 
 # ------------------------------------------------------------ config I/O ---
@@ -112,6 +149,54 @@ def save_excludes(paths):
         f.write("# Folders excluded from sync (absolute paths, one per line).\n")
         for p in paths:
             f.write(p + "\n")
+
+
+# POLL_INTERVAL is stored in seconds (the daemon sleeps on it); the UI edits
+# whole minutes.
+def poll_minutes_from_config(value):
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = POLL_DEFAULT_SECONDS
+    if seconds <= 0:
+        seconds = POLL_DEFAULT_SECONDS
+    return max(1, int(seconds / 60 + 0.5))
+
+
+def poll_minutes_to_config(minutes):
+    return str(max(1, int(minutes)) * 60)
+
+
+# FULL_CHECK_INTERVAL is stored in seconds; the UI edits whole hours.
+def hours_from_config(value):
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = FULL_CHECK_DEFAULT_SECONDS
+    if seconds <= 0:
+        seconds = FULL_CHECK_DEFAULT_SECONDS
+    return max(1, int(seconds / 3600 + 0.5))
+
+
+def hours_to_config(hours):
+    return str(max(1, int(hours)) * 3600)
+
+
+def state_title(state, status):
+    """(color, text) for the big state line."""
+    return STATE_TEXT.get(state, ("#868e96", "No sync activity yet"))
+
+
+def relative_name(path, root):
+    """Path shown relative to the sync folder; absolute when outside it."""
+    root = (root or "").rstrip("/")
+    if root and path.startswith(root + "/"):
+        return path[len(root) + 1:]
+    return path
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
 
 
 # --------------------------------------------------------------- backend ---
@@ -165,18 +250,25 @@ def start_daemon():
     )
 
 
+def request_sync(full=False):
+    """Ask the running daemon for a pass right away (it watches this file).
+    Content "full" asks for a full check instead of a quick sync."""
+    os.makedirs(os.path.dirname(TRIGGER_FILE), exist_ok=True)
+    with open(TRIGGER_FILE, "w") as f:
+        f.write("full" if full else "quick")
+
+
 def set_autostart(enabled):
     """Register/unregister the daemon to start at login, and apply now."""
     if IS_SNAP:
         if enabled:
             os.makedirs(os.path.dirname(SNAP_AUTOSTART), exist_ok=True)
-            snap_name = os.environ.get("SNAP_NAME", "proton-sync")
             with open(SNAP_AUTOSTART, "w") as f:
                 f.write(
                     "[Desktop Entry]\n"
                     "Type=Application\n"
                     "Name=Proton Sync daemon\n"
-                    f"Exec=/snap/bin/{snap_name}.daemon\n"
+                    f"Exec=/snap/bin/{SNAP_NAME}.daemon\n"
                     "NoDisplay=true\n"
                     "X-GNOME-Autostart-enabled=true\n"
                 )
@@ -221,10 +313,13 @@ def set_autostart(enabled):
 def autostart_enabled():
     if IS_SNAP:
         return os.path.exists(SNAP_AUTOSTART)
-    r = subprocess.run(
-        ["systemctl", "--user", "is-enabled", "proton-sync.service"],
-        capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "proton-sync.service"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     return r.stdout.strip() == "enabled"
 
 
@@ -251,6 +346,79 @@ def read_history(n=CHART_PASSES):
     return rows
 
 
+def read_queue():
+    """queue.tsv -> [{state, path, note}], malformed lines skipped."""
+    rows = []
+    try:
+        with open(QUEUE_FILE) as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2 or parts[0] not in QUEUE_STATES or not parts[1]:
+                    continue
+                rows.append({"state": parts[0], "path": parts[1],
+                             "note": parts[2] if len(parts) > 2 else ""})
+    except OSError:
+        pass
+    return rows
+
+
+def read_events(n=LIVE_EVENTS):
+    """Last n lines of events.tsv -> [(epoch, kind, path, detail)], oldest first."""
+    rows = []
+    try:
+        with open(EVENTS_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        if size > 256 * 1024 and lines:
+            lines = lines[1:]
+        for line in lines[-n:]:
+            parts = line.split("\t")
+            if len(parts) < 2 or parts[1] not in EVENT_KINDS:
+                continue
+            try:
+                ts = int(parts[0])
+            except ValueError:
+                continue
+            rows.append((ts, parts[1], parts[2] if len(parts) > 2 else "",
+                         parts[3] if len(parts) > 3 else ""))
+    except OSError:
+        pass
+    return rows
+
+
+def describe_event(kind, path, detail, root="", login_cmd="proton-drive auth login"):
+    """One live-feed line -> (severity, text, secondary text)."""
+    name = relative_name(path, root) if path else ""
+    if kind == "pass-start":
+        return ("busy", "Sync started", "checking all files" if detail == "full" else "")
+    if kind == "pass-end":
+        return ("ok", "Sync finished", detail)
+    if kind == "uploading":
+        return ("busy", f"Uploading {name}", detail)
+    if kind == "done":
+        return ("ok", name, detail)
+    if kind == "failed":
+        return ("fail", describe_failure(name, detail, login_cmd)[0], detail)
+    if kind == "retry":
+        return ("warn", f"Retrying {name}", detail)
+    if kind == "new":
+        return ("added", f"Added {name}", "")
+    if kind == "updated":
+        return ("updated", f"Updated {name}", "")
+    if kind == "more":
+        return ("off", f"… and {detail} in {name}", "")
+    if kind == "folder":
+        return ("off", f"Created folder {name}", "")
+    if kind == "trashed":
+        return ("off", f"Moved to trash {name}", detail)
+    if kind == "trash-failed":
+        return ("fail", f"Could not move {name} to the trash",
+                "It is retried on the next sync.")
+    return ("off", f"{kind} {name}", detail)
+
+
 def read_log_tail(max_bytes=8192, max_lines=150):
     try:
         with open(LOG_FILE, "rb") as f:
@@ -275,9 +443,208 @@ def human_bytes(n):
 
 
 def fmt_time(epoch):
+    """Clock time for today, date + time for anything older."""
     if not epoch:
         return "—"
-    return time.strftime("%H:%M:%S", time.localtime(epoch))
+    t = time.localtime(epoch)
+    if t[:3] == time.localtime()[:3]:
+        return time.strftime("%H:%M", t)
+    return time.strftime("%b %-d, %H:%M", t)
+
+
+# --------------------------------------------------------- plain-language ---
+def login_command(cli):
+    if IS_SNAP:
+        return f"{SNAP_NAME}.proton-drive auth login"
+    return f"{cli or 'proton-drive'} auth login"
+
+
+def login_check_result(cli, returncode, output):
+    """-> (severity, title, advice) for the Checks list."""
+    if not cli:
+        return ("fail", "Proton Drive CLI not found",
+                "Put the proton-drive program next to the app, or point "
+                "PROTON_DRIVE_CLI in the config file at it.")
+    if returncode == 0:
+        return ("ok", "Logged in to Proton Drive", "")
+    if returncode is not None and "You need to login first" in output:
+        return ("fail", "Not logged in to Proton Drive",
+                f"Open a terminal and run:  {login_command(cli)}")
+    return ("warn", "Could not check the Proton Drive login",
+            "Probably offline. The check runs again in a moment.")
+
+
+def probe_login(cli):
+    if not cli:
+        return login_check_result(cli, None, "")
+    try:
+        r = subprocess.run([cli, "filesystem", "list", "/"],
+                           capture_output=True, text=True, timeout=60)
+        return login_check_result(cli, r.returncode, r.stdout + r.stderr)
+    except (subprocess.TimeoutExpired, OSError):
+        return login_check_result(cli, None, "")
+
+
+def service_check_result(running, autostart):
+    """autostart may be None while it is still being determined."""
+    if running:
+        return ("ok", "Background sync is running", "")
+    if autostart:
+        return ("fail", "Background sync is not running",
+                "It starts again at your next login." if IS_SNAP
+                else "It restarts on its own within 2 minutes.")
+    if autostart is None:
+        return ("fail", "Background sync is not running", "")
+    return ("off", "Background sync is off",
+            "Turn it on in Settings and press Save.")
+
+
+def autostart_check_result(enabled):
+    if enabled:
+        return ("ok", "Starts automatically when you log in", "")
+    return ("off", "Does not start automatically",
+            "Turn on background sync in Settings and press Save.")
+
+
+# Known failure classes -> what happened and what to do. Matched against the
+# lower-cased reason the daemon stored in queue.tsv; first hit wins.
+FAILURE_RULES = (
+    (("skip-thumbnails", "thumbnail"),
+     "Some images in {name} could not be processed",
+     "Proton Drive could not create previews for them. They are retried on "
+     "the next sync."),
+    (("enoent", "no such file"),
+     "{name} changed while it was being uploaded",
+     "Nothing to do. It is retried on the next sync."),
+    (("eacces", "eperm", "permission denied"),
+     "No permission to read {name}",
+     "Check the file's permissions. The next sync picks it up."),
+    (("enospc", "quota", "storage", "insufficient space", "exceeded"),
+     "Not enough space on Proton Drive for {name}",
+     "Free up space in Proton Drive or upgrade your plan."),
+    (("econn", "etimedout", "enotfound", "eai_again", "network",
+      "fetch failed", "socket", "timed out", "timeout"),
+     "Connection problem while uploading {name}",
+     "Check your internet connection. It is retried on the next sync."),
+    (("login", "session", "unauthorized", "401"),
+     "Proton Drive session expired while uploading {name}",
+     "Log in again: open a terminal and run  {login}"),
+)
+
+
+def describe_failure(name, reason, login_cmd="proton-drive auth login"):
+    low = (reason or "").lower()
+    for needles, title, advice in FAILURE_RULES:
+        if any(n in low for n in needles):
+            return (title.format(name=name),
+                    advice.format(name=name, login=login_cmd))
+    return (f"Could not upload {name}",
+            "It is retried on the next sync. If it keeps failing, the "
+            "details below and the technical log say why.")
+
+
+def describe_problems(status, queue, running, poll_minutes, root="",
+                      login_cmd="proton-drive auth login"):
+    """Things worth the user's attention: (severity, title, advice, details).
+
+    Login/service/autostart are covered by the Checks list and not repeated.
+    """
+    status = status or {}
+    state = status.get("state", "")
+    current = str(status.get("current", "") or "")
+    out = []
+    if root and not os.path.isdir(root):
+        out.append(("fail", "The sync folder is missing",
+                    "If it is on an external drive, plug it in and the sync "
+                    "continues on its own. Otherwise choose another folder "
+                    "in Settings.", root))
+    elif state == "unconfigured":
+        out.append(("fail", "Not set up yet",
+                    "Choose a folder to sync in Settings and press Save.", ""))
+    elif state == "error" and not current.startswith("Sync folder not found"):
+        out.append(("fail", "Proton Drive could not be reached",
+                    "Check your internet connection. The sync retries on "
+                    "its own.", current))
+    if running and state == "polling":
+        if IS_SNAP:
+            advice = ("Instant change detection is not working; the "
+                      "technical log says why.")
+        else:
+            advice = ("For instant sync install the inotify-tools package "
+                      "(sudo apt install inotify-tools). It is picked up "
+                      "automatically.")
+        out.append(("warn", "Changes are only picked up every "
+                    + plural(poll_minutes, "minute"), advice, ""))
+    failed = [r for r in queue if r["state"] == "failed"]
+    for r in failed[:MAX_PROBLEM_ROWS]:
+        title, advice = describe_failure(relative_name(r["path"], root),
+                                         r["note"], login_cmd)
+        out.append(("fail", title, advice, r["note"]))
+    if len(failed) > MAX_PROBLEM_ROWS:
+        out.append(("fail", f"{len(failed) - MAX_PROBLEM_ROWS} more could "
+                    "not be uploaded", "The full list is in the technical "
+                    "log.", ""))
+    errors = int(status.get("pass_errors", 0) or 0)
+    if errors > len(failed):
+        out.append(("warn", plural(errors - len(failed), "other problem")
+                    + " in the last sync",
+                    "Usually a deleted file that could not be moved to the "
+                    "Proton Drive trash. It is retried on the next sync; "
+                    "details are in the technical log.", ""))
+    return out
+
+
+def queue_summary(rows, running):
+    if not rows:
+        return ""
+    n = len(rows)
+    done = sum(1 for r in rows if r["state"] == "done")
+    unchanged = sum(1 for r in rows if r["state"] == "unchanged")
+    failed = sum(1 for r in rows if r["state"] == "failed")
+    finished = done + unchanged + failed
+    if finished < n:
+        text = f"{finished} of {n} done"
+    else:
+        parts = []
+        if done:
+            parts.append(f"{done} uploaded")
+        if unchanged:
+            parts.append(f"{unchanged} unchanged")
+        text = " · ".join(parts) if parts else f"{n} done"
+    if failed:
+        text += f" · {failed} failed"
+    return text
+
+
+def pass_summary(status, in_progress=False):
+    items = int(status.get("pass_items", 0) or 0)
+    nbytes = int(status.get("pass_bytes", 0) or 0)
+    if items:
+        parts = [plural(items, "file") + (f" · {human_bytes(nbytes)}" if nbytes else "")]
+    else:
+        parts = ["no new files so far" if in_progress else "nothing new to upload"]
+    if status.get("pass_trashed"):
+        parts.append(f"{status['pass_trashed']} moved to trash")
+    if status.get("pass_errors"):
+        parts.append(plural(int(status["pass_errors"]), "problem"))
+    if status.get("pass_started"):
+        parts.append("started " + fmt_time(status["pass_started"]))
+    return " · ".join(parts)
+
+
+def total_summary(status):
+    passes = int(status.get("passes_done", 0) or 0)
+    if not passes:
+        return "No sync finished yet"
+    items = int(status.get("total_items", 0) or 0)
+    nbytes = int(status.get("total_bytes", 0) or 0)
+    parts = [plural(passes, "sync"),
+             plural(items, "file") + (f" · {human_bytes(nbytes)}" if nbytes else "")]
+    if status.get("total_trashed"):
+        parts.append(f"{status['total_trashed']} moved to trash")
+    if status.get("total_errors"):
+        parts.append(plural(int(status["total_errors"]), "problem"))
+    return " · ".join(parts)
 
 
 # ----------------------------------------------------------------- chart ---
@@ -288,7 +655,7 @@ class PassChart(Gtk.DrawingArea):
         super().__init__()
         self.history = []
         self._bars = []  # (x0, x1, record) hit boxes for tooltips
-        self.set_size_request(-1, 130)
+        self.set_size_request(-1, 120)
         self.set_has_tooltip(True)
         self.connect("draw", self.on_draw)
         self.connect("query-tooltip", self.on_tooltip)
@@ -301,10 +668,10 @@ class PassChart(Gtk.DrawingArea):
     def on_tooltip(self, _w, x, _y, _kbd, tooltip):
         for x0, x1, rec in self._bars:
             if x0 <= x <= x1:
-                err = f", {rec['errors']} errors" if rec.get("errors") else ""
+                err = f", {rec['errors']} problems" if rec.get("errors") else ""
                 dur = max(0, rec.get("end", 0) - rec.get("start", 0))
                 tooltip.set_text(
-                    f"{fmt_time(rec.get('end'))} — {rec.get('items', 0)} items, "
+                    f"{fmt_time(rec.get('end'))} — {rec.get('items', 0)} files, "
                     f"{human_bytes(rec.get('bytes', 0))}{err}, {dur}s"
                 )
                 return True
@@ -324,7 +691,7 @@ class PassChart(Gtk.DrawingArea):
 
         if not self.history:
             cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
-            msg = "No completed sync passes yet"
+            msg = "No finished syncs yet"
             ext = cr.text_extents(msg)
             cr.move_to((w - ext.width) / 2, h / 2)
             cr.show_text(msg)
@@ -385,152 +752,374 @@ class PassChart(Gtk.DrawingArea):
         cr.show_text(lbl)
 
 
+# ------------------------------------------------------------- widgets ---
+def small_markup(label, text):
+    label.set_markup(f"<small>{esc(text)}</small>")
+
+
+class Heading(Gtk.Box):
+    """Section heading: bold title, optional small subtitle, optional dim
+    info text at the right and an optional action button."""
+
+    def __init__(self, title, subtitle=None, info=False, action=None,
+                 margin_top=0):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
+                         margin_top=margin_top)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1,
+                       hexpand=True, valign=Gtk.Align.CENTER)
+        self.title = Gtk.Label(xalign=0)
+        self.title.set_markup(f"<b>{esc(title)}</b>")
+        text.pack_start(self.title, False, False, 0)
+        self.subtitle = None
+        if subtitle is not None:
+            self.subtitle = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            self.subtitle.get_style_context().add_class("dim-label")
+            small_markup(self.subtitle, subtitle)
+            text.pack_start(self.subtitle, False, False, 0)
+        self.pack_start(text, True, True, 0)
+        self.info = None
+        if info:
+            self.info = Gtk.Label(xalign=1, valign=Gtk.Align.CENTER)
+            self.info.get_style_context().add_class("dim-label")
+            self.pack_start(self.info, False, False, 0)
+        if action is not None:
+            action.set_valign(Gtk.Align.CENTER)
+            self.pack_end(action, False, False, 0)
+
+    def set_subtitle(self, text):
+        if self.subtitle is not None:
+            small_markup(self.subtitle, text)
+
+    def set_info(self, text):
+        if self.info is not None:
+            self.info.set_text(text)
+
+
+class NoteRow(Gtk.Box):
+    """Glyph + title + optional advice + optional one-line details."""
+
+    def __init__(self, selectable=False):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.glyph = Gtk.Label(xalign=0.5, yalign=0, width_chars=2)
+        self.pack_start(self.glyph, False, False, 0)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.title = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        self.advice = Gtk.Label(xalign=0, wrap=True, max_width_chars=60,
+                                selectable=selectable)
+        # Selectable so a command can be copied, but never auto-focused
+        # (GTK would select the whole text on first show).
+        self.advice.set_can_focus(False)
+        self.advice.get_style_context().add_class("dim-label")
+        self.advice.set_no_show_all(True)
+        self.details = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                                 max_width_chars=60)
+        self.details.get_style_context().add_class("dim-label")
+        self.details.set_no_show_all(True)
+        for lbl in (self.title, self.advice, self.details):
+            text.pack_start(lbl, False, False, 0)
+        self.pack_start(text, True, True, 0)
+
+    def set_content(self, severity, title, advice="", details=""):
+        color, glyph = GLYPHS[severity]
+        self.glyph.set_markup(
+            f'<span foreground="{color}" weight="bold">{glyph}</span>')
+        self.title.set_text(title)
+        small_markup(self.advice, advice)
+        self.advice.set_visible(bool(advice))
+        small_markup(self.details, details)
+        self.details.set_visible(bool(details))
+        self.details.set_tooltip_text(details or None)
+
+
 # -------------------------------------------------------------------- UI ---
 class SettingsWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Proton Sync")
-        self.set_default_size(600, 680)
+        self.set_default_size(640, 760)
         self.cfg = load_config()
         self.cli = find_cli(self.cfg)
         self.sync_proc = None
         self._log_cache = None
+        self._queue_cache = None
+        self._live_cache = None
+        self._problems_cache = None
+        self._autostart = None
+        self._check_thread = None
+        self._toast_timeout = None
 
         header = Gtk.HeaderBar(show_close_button=True)
         self.set_titlebar(header)
         self.save_btn = Gtk.Button(label="Save")
         self.save_btn.get_style_context().add_class("suggested-action")
         self.save_btn.connect("clicked", self.on_save)
+        self.save_btn.set_no_show_all(True)  # only shown on the Settings page
         header.pack_end(self.save_btn)
 
         self.stack = Gtk.Stack(
             transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         switcher = Gtk.StackSwitcher(stack=self.stack)
         header.set_custom_title(switcher)
-        self.add(self.stack)
+
+        # Short messages ("Settings saved.") slide in over the page.
+        overlay = Gtk.Overlay()
+        self.add(overlay)
+        overlay.add(self.stack)
+        self.toast = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+            halign=Gtk.Align.CENTER, valign=Gtk.Align.START)
+        toast_box = Gtk.Box()
+        toast_box.get_style_context().add_class("app-notification")
+        self.toast_label = Gtk.Label(margin_start=12, margin_end=12,
+                                     margin_top=4, margin_bottom=4)
+        toast_box.add(self.toast_label)
+        self.toast.add(toast_box)
+        overlay.add_overlay(self.toast)
+        overlay.set_overlay_pass_through(self.toast, True)
 
         self.stack.add_titled(self._build_settings_page(), "settings",
                               "Settings")
         self.stack.add_titled(self._build_activity_page(), "activity",
                               "Activity")
+        self.stack.connect("notify::visible-child-name", self._on_page_changed)
+        self.save_btn.show()
 
-        self.refresh_status()
-        self.refresh_activity()
-        GLib.timeout_add_seconds(10, self.refresh_status)
+        # Gtk.Stack ignores set_visible_child() until its children are shown,
+        # so the first refresh runs once the window is mapped.
+        self._started = False
+        self.connect("map", self._on_map)
+        GLib.timeout_add_seconds(10, self.refresh_checks)
         GLib.timeout_add_seconds(2, self.refresh_activity)
+
+    def _on_map(self, *_args):
+        if self._started:
+            return
+        self._started = True
+        self._on_files_view_toggled(None)
+        self.refresh_checks()
+        self.refresh_activity()
+
+    def _on_page_changed(self, *_args):
+        self.save_btn.set_visible(
+            self.stack.get_visible_child_name() == "settings")
 
     # ------------------------------------------------------ settings page --
     def _build_settings_page(self):
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
                         margin=18)
-
-        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        grid = Gtk.Grid(column_spacing=18, row_spacing=14)
         outer.pack_start(grid, False, False, 0)
 
-        grid.attach(self._label("Folder to sync"), 0, 0, 1, 1)
         self.folder_btn = Gtk.FileChooserButton(
-            title="Select folder to sync",
+            title="Folder to sync",
             action=Gtk.FileChooserAction.SELECT_FOLDER,
         )
         self.folder_btn.set_hexpand(True)
+        self.folder_btn.set_valign(Gtk.Align.CENTER)
         local_root = self.cfg.get("LOCAL_ROOT", "")
         if local_root:
             self.folder_btn.set_filename(local_root)
-        grid.attach(self.folder_btn, 1, 0, 1, 1)
+        self.folder_btn.connect("file-set",
+                                lambda *_: self._refresh_exclude_labels())
+        self._settings_row(grid, 0, "Folder to sync", None, self.folder_btn)
 
-        grid.attach(self._label("Folder name on Proton Drive"), 0, 1, 1, 1)
-        self.remote_entry = Gtk.Entry(hexpand=True)
+        self.remote_entry = Gtk.Entry(hexpand=True, valign=Gtk.Align.CENTER)
         self.remote_entry.set_text(self.cfg.get("REMOTE_ROOT", ""))
         self.remote_entry.set_placeholder_text("/my-files/Desktop")
-        grid.attach(self.remote_entry, 1, 1, 1, 1)
+        self._settings_row(grid, 1, "Folder on Proton Drive", None,
+                           self.remote_entry)
 
-        grid.attach(self._label("Fallback check interval (seconds)"), 0, 2, 1, 1)
-        adj = Gtk.Adjustment(value=int(self.cfg.get("POLL_INTERVAL", 300) or 300),
-                             lower=30, upper=3600, step_increment=30)
+        interval = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                           valign=Gtk.Align.CENTER)
+        adj = Gtk.Adjustment(
+            value=poll_minutes_from_config(self.cfg.get("POLL_INTERVAL")),
+            lower=1, upper=1440, step_increment=1, page_increment=10)
         self.poll_spin = Gtk.SpinButton(adjustment=adj, numeric=True)
-        grid.attach(self.poll_spin, 1, 2, 1, 1)
+        interval.pack_start(self.poll_spin, False, False, 0)
+        interval.pack_start(Gtk.Label(label="minutes"), False, False, 0)
+        self._settings_row(
+            grid, 2, "Check for changes every",
+            "Safety net for when instant change detection is unavailable",
+            interval)
 
-        grid.attach(self._label("Sync automatically in the background"), 0, 3, 1, 1)
-        self.auto_switch = Gtk.Switch(halign=Gtk.Align.START)
+        full = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                       valign=Gtk.Align.CENTER)
+        adj = Gtk.Adjustment(
+            value=hours_from_config(self.cfg.get("FULL_CHECK_INTERVAL")),
+            lower=1, upper=720, step_increment=1, page_increment=24)
+        self.full_spin = Gtk.SpinButton(adjustment=adj, numeric=True)
+        full.pack_start(self.full_spin, False, False, 0)
+        full.pack_start(Gtk.Label(label="hours"), False, False, 0)
+        self._settings_row(
+            grid, 3, "Verify all files every",
+            "Syncs normally look only at files that changed; this also "
+            "re-checks the rest",
+            full)
+
+        self.auto_switch = Gtk.Switch(halign=Gtk.Align.START,
+                                      valign=Gtk.Align.CENTER)
         self.auto_switch.set_active(autostart_enabled())
-        grid.attach(self.auto_switch, 1, 3, 1, 1)
+        self._settings_row(
+            grid, 4, "Background sync",
+            "Starts when you log in and uploads whenever files change",
+            self.auto_switch)
 
-        del_label = self._label("Sync deletions")
-        del_label.set_tooltip_text(
-            "When a file is deleted locally, move it to the Proton Drive "
-            "trash on the next pass. It stays recoverable in the trash. "
-            "When off, deleted files simply remain on Proton Drive.")
-        grid.attach(del_label, 0, 4, 1, 1)
-        self.del_switch = Gtk.Switch(halign=Gtk.Align.START)
-        self.del_switch.set_tooltip_text(del_label.get_tooltip_text())
+        self.del_switch = Gtk.Switch(halign=Gtk.Align.START,
+                                     valign=Gtk.Align.CENTER)
         self.del_switch.set_active(
             self.cfg.get("SYNC_DELETES", "false") == "true")
-        grid.attach(self.del_switch, 1, 4, 1, 1)
+        self._settings_row(
+            grid, 5, "Sync deletions",
+            "Files you delete here move to the Proton Drive trash, where "
+            "they can be restored",
+            self.del_switch)
 
-        frame = Gtk.Frame(label="Excluded folders (not synced)")
-        outer.pack_start(frame, True, True, 0)
-        fbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
-                       margin=8)
-        frame.add(fbox)
-        scroll = Gtk.ScrolledWindow(min_content_height=110)
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        outer.pack_start(section, True, True, 0)
+        section.pack_start(
+            Heading("Excluded folders",
+                    subtitle="Subfolders that are never uploaded"),
+            False, False, 0)
+        scroll = Gtk.ScrolledWindow(min_content_height=120,
+                                    shadow_type=Gtk.ShadowType.IN)
         self.excl_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        placeholder = Gtk.Label(label="No folders excluded", margin=12)
+        placeholder.get_style_context().add_class("dim-label")
+        placeholder.show()
+        self.excl_list.set_placeholder(placeholder)
         scroll.add(self.excl_list)
-        fbox.pack_start(scroll, True, True, 0)
-        for p in load_excludes():
-            self._add_exclude_row(p)
+        section.pack_start(scroll, True, True, 0)
         btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         add_btn = Gtk.Button(label="Add folder…")
         add_btn.connect("clicked", self.on_add_exclude)
-        rm_btn = Gtk.Button(label="Remove selected")
-        rm_btn.connect("clicked", self.on_remove_exclude)
+        self.rm_btn = Gtk.Button(label="Remove", sensitive=False)
+        self.rm_btn.connect("clicked", self.on_remove_exclude)
+        self.excl_list.connect(
+            "row-selected",
+            lambda _l, row: self.rm_btn.set_sensitive(row is not None))
         btns.pack_start(add_btn, False, False, 0)
-        btns.pack_start(rm_btn, False, False, 0)
-        fbox.pack_start(btns, False, False, 0)
-
-        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        outer.pack_start(actions, False, False, 0)
-        self.sync_btn = Gtk.Button(label="Sync now")
-        self.sync_btn.connect("clicked", self.on_sync_now)
-        log_btn = Gtk.Button(label="Open log")
-        log_btn.connect("clicked", self.on_open_log)
-        actions.pack_start(self.sync_btn, False, False, 0)
-        actions.pack_start(log_btn, False, False, 0)
-
-        self.status = Gtk.Label(xalign=0, wrap=True)
-        self.status.get_style_context().add_class("dim-label")
-        outer.pack_end(self.status, False, False, 0)
+        btns.pack_start(self.rm_btn, False, False, 0)
+        section.pack_start(btns, False, False, 0)
+        for p in load_excludes():
+            self._add_exclude_row(p)
         return outer
+
+    @staticmethod
+    def _settings_row(grid, row, title, subtitle, widget):
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                       valign=Gtk.Align.CENTER)
+        text.pack_start(Gtk.Label(label=title, xalign=0), False, False, 0)
+        if subtitle:
+            sub = Gtk.Label(xalign=0, wrap=True, max_width_chars=34)
+            sub.get_style_context().add_class("dim-label")
+            small_markup(sub, subtitle)
+            text.pack_start(sub, False, False, 0)
+        grid.attach(text, 0, row, 1, 1)
+        grid.attach(widget, 1, row, 1, 1)
 
     # ------------------------------------------------------ activity page --
     def _build_activity_page(self):
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
                         margin=18)
 
-        self.state_label = Gtk.Label(xalign=0)
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        state_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                            hexpand=True, valign=Gtk.Align.CENTER)
+        self.state_label = Gtk.Label(xalign=0,
+                                     ellipsize=Pango.EllipsizeMode.END)
         self.state_label.set_markup("<b>…</b>")
-        outer.pack_start(self.state_label, False, False, 0)
-        self.state_detail = Gtk.Label(xalign=0, wrap=True,
-                                      ellipsize=3)  # PANGO_ELLIPSIZE_END
+        self.state_detail = Gtk.Label(xalign=0,
+                                      ellipsize=Pango.EllipsizeMode.MIDDLE)
         self.state_detail.get_style_context().add_class("dim-label")
-        outer.pack_start(self.state_detail, False, False, 0)
+        state_box.pack_start(self.state_label, False, False, 0)
+        state_box.pack_start(self.state_detail, False, False, 0)
+        top.pack_start(state_box, True, True, 0)
+        self.sync_btn = Gtk.Button(label="Sync now", valign=Gtk.Align.CENTER)
+        self.sync_btn.set_tooltip_text("Upload what changed, right away")
+        self.sync_btn.connect("clicked", self.on_sync_now)
+        top.pack_end(self.sync_btn, False, False, 0)
+        outer.pack_start(top, False, False, 0)
 
-        cgrid = Gtk.Grid(column_spacing=24, row_spacing=4)
-        outer.pack_start(cgrid, False, False, 0)
-        self.counter_labels = {}
-        cols = [
-            ("pass", "Current / last pass"),
-            ("total", "Since service start"),
-        ]
-        for col, (key, title) in enumerate(cols):
-            t = Gtk.Label(xalign=0)
-            t.set_markup(f"<b>{title}</b>")
-            cgrid.attach(t, col, 0, 1, 1)
-            val = Gtk.Label(xalign=0)
-            val.set_text("—")
-            self.counter_labels[key] = val
-            cgrid.attach(val, col, 1, 1, 1)
+        outer.pack_start(Heading("Checks", margin_top=10), False, False, 0)
+        self.check_rows = {}
+        for key, waiting in (("login", "Checking the Proton Drive login…"),
+                             ("service", "Checking background sync…"),
+                             ("autostart", "Checking autostart…")):
+            row = NoteRow(selectable=(key == "login"))
+            row.set_content("pending", waiting)
+            self.check_rows[key] = row
+            outer.pack_start(row, False, False, 0)
 
-        chart_frame = Gtk.Frame(
-            label=f"Data uploaded per sync pass (last {CHART_PASSES})")
+        outer.pack_start(Heading("Needs attention", margin_top=10),
+                         False, False, 0)
+        self.problem_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                   spacing=8)
+        outer.pack_start(self.problem_box, False, False, 0)
+
+        switch = Gtk.Box()
+        switch.get_style_context().add_class("linked")
+        self.queue_btn = Gtk.RadioButton.new_with_label(None, "Queue")
+        self.queue_btn.set_mode(False)
+        self.live_btn = Gtk.RadioButton.new_with_label_from_widget(
+            self.queue_btn, "Live")
+        self.live_btn.set_mode(False)
+        self.live_btn.set_tooltip_text(
+            "Every file as it is added, updated or moved to the trash")
+        switch.pack_start(self.queue_btn, False, False, 0)
+        switch.pack_start(self.live_btn, False, False, 0)
+        self.files_heading = Heading("Files", subtitle="", info=True,
+                                     action=switch, margin_top=10)
+        outer.pack_start(self.files_heading, False, False, 0)
+        self.queue_store = Gtk.ListStore(str, str, str)  # glyph, name, tooltip
+        self.queue_view = Gtk.TreeView(model=self.queue_store,
+                                       headers_visible=False)
+        self.queue_view.set_tooltip_column(2)
+        self.queue_view.get_selection().set_mode(Gtk.SelectionMode.NONE)
+        col = Gtk.TreeViewColumn("", Gtk.CellRendererText(xalign=0.5),
+                                 markup=0)
+        self.queue_view.append_column(col)
+        name_cell = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE)
+        col = Gtk.TreeViewColumn("", name_cell, text=1)
+        col.set_expand(True)
+        self.queue_view.append_column(col)
+        qscroll = Gtk.ScrolledWindow(min_content_height=150,
+                                     shadow_type=Gtk.ShadowType.IN)
+        qscroll.add(self.queue_view)
+        self.files_stack = self._list_or_empty(qscroll, "Nothing synced yet")
+
+        # live feed: newest first
+        self.live_store = Gtk.ListStore(str, str, str, str)
+        # time, glyph markup, text + dim detail markup, tooltip
+        self.live_view = Gtk.TreeView(model=self.live_store,
+                                      headers_visible=False)
+        self.live_view.set_tooltip_column(3)
+        self.live_view.get_selection().set_mode(Gtk.SelectionMode.NONE)
+        time_cell = Gtk.CellRendererText(xalign=1)
+        time_cell.set_property("foreground", "#868e96")
+        self.live_view.append_column(Gtk.TreeViewColumn("", time_cell, text=0))
+        self.live_view.append_column(
+            Gtk.TreeViewColumn("", Gtk.CellRendererText(xalign=0.5), markup=1))
+        text_cell = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        col = Gtk.TreeViewColumn("", text_cell, markup=2)
+        col.set_expand(True)
+        self.live_view.append_column(col)
+        lscroll = Gtk.ScrolledWindow(min_content_height=150,
+                                     shadow_type=Gtk.ShadowType.IN)
+        lscroll.add(self.live_view)
+        self.live_stack = self._list_or_empty(lscroll, "No activity yet")
+
+        self.files_view = Gtk.Stack()
+        self.files_view.add_named(self.files_stack, "queue")
+        self.files_view.add_named(self.live_stack, "live")
+        outer.pack_start(self.files_view, True, True, 0)
+        self.live_btn.connect("toggled", self._on_files_view_toggled)
+        # Start on the live view while a sync is running.
+        status = read_status() or {}
+        self.live_btn.set_active(status.get("state") in BUSY_STATES
+                                 and daemon_running())
+
+        self.history_heading = Heading("History", info=True, margin_top=10)
+        outer.pack_start(self.history_heading, False, False, 0)
+        chart_frame = Gtk.Frame()
         if HAVE_CAIRO:
             self.chart = PassChart()
             chart_frame.add(self.chart)
@@ -544,28 +1133,56 @@ class SettingsWindow(Gtk.ApplicationWindow):
             chart_frame.add(hint)
         outer.pack_start(chart_frame, False, False, 0)
 
-        log_frame = Gtk.Frame(label="Recent log")
-        lbox = Gtk.ScrolledWindow(min_content_height=160)
+        expander = Gtk.Expander(label="Technical log", margin_top=10)
+        expander.set_resize_toplevel(True)
+        lbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                       margin_top=6)
+        lscroll = Gtk.ScrolledWindow(min_content_height=180,
+                                     shadow_type=Gtk.ShadowType.IN)
         self.log_view = Gtk.TextView(editable=False, cursor_visible=False,
                                      monospace=True)
         self.log_view.set_wrap_mode(Gtk.WrapMode.NONE)
-        lbox.add(self.log_view)
-        log_frame.add(lbox)
-        outer.pack_start(log_frame, True, True, 0)
+        lscroll.add(self.log_view)
+        lbox.pack_start(lscroll, True, True, 0)
+        log_btn = Gtk.Button(label="Open full log", halign=Gtk.Align.START)
+        log_btn.connect("clicked", self.on_open_log)
+        lbox.pack_start(log_btn, False, False, 0)
+        expander.add(lbox)
+        outer.pack_start(expander, False, False, 0)
         return outer
 
     @staticmethod
-    def _label(text):
-        return Gtk.Label(label=text, xalign=0)
+    def _list_or_empty(scrolled, empty_text):
+        stack = Gtk.Stack()
+        stack.add_named(scrolled, "list")
+        empty = Gtk.Label(label=empty_text, margin=24)
+        empty.get_style_context().add_class("dim-label")
+        stack.add_named(empty, "empty")
+        return stack
+
+    def _on_files_view_toggled(self, _btn):
+        self.files_view.set_visible_child_name(
+            "live" if self.live_btn.get_active() else "queue")
 
     # ---- excludes list helpers
     def _add_exclude_row(self, path):
         row = Gtk.ListBoxRow()
         row.path = path
-        row.add(Gtk.Label(label=path, xalign=0, margin=4,
-                          ellipsize=3))  # PANGO_ELLIPSIZE_END
+        row.label = Gtk.Label(xalign=0, margin=6,
+                              ellipsize=Pango.EllipsizeMode.MIDDLE)
+        row.add(row.label)
         self.excl_list.add(row)
+        self._set_exclude_label(row)
         self.excl_list.show_all()
+
+    def _set_exclude_label(self, row):
+        row.label.set_text(
+            relative_name(row.path, self.folder_btn.get_filename() or ""))
+        row.set_tooltip_text(row.path)
+
+    def _refresh_exclude_labels(self):
+        for row in self.excl_list.get_children():
+            self._set_exclude_label(row)
 
     def current_excludes(self):
         return [row.path for row in self.excl_list.get_children()]
@@ -608,7 +1225,10 @@ class SettingsWindow(Gtk.ApplicationWindow):
         self.cfg.update({
             "LOCAL_ROOT": local_root,
             "REMOTE_ROOT": remote,
-            "POLL_INTERVAL": str(self.poll_spin.get_value_as_int()),
+            "POLL_INTERVAL": poll_minutes_to_config(
+                self.poll_spin.get_value_as_int()),
+            "FULL_CHECK_INTERVAL": hours_to_config(
+                self.full_spin.get_value_as_int()),
             "DEBOUNCE": self.cfg.get("DEBOUNCE", "30"),
             "SYNC_DELETES": "true" if self.del_switch.get_active() else "false",
         })
@@ -617,15 +1237,28 @@ class SettingsWindow(Gtk.ApplicationWindow):
         save_config(self.cfg)
         save_excludes(self.current_excludes())
         set_autostart(self.auto_switch.get_active())
-        self.flash("Settings saved.")
-        self.refresh_status()
+        if daemon_running():
+            # The daemon re-reads the config before every pass.
+            request_sync()
+            self.flash("Settings saved — syncing with the new settings.")
+        else:
+            self.flash("Settings saved.")
+        self._refresh_exclude_labels()
+        self.refresh_checks()
+        self.refresh_activity()
 
     def on_sync_now(self, _btn):
-        if self.sync_proc and self.sync_proc.poll() is None:
+        # The daemon decides on its own whether this is a quick sync or the
+        # periodic re-verification of all files.
+        if self.sync_proc is not None and self.sync_proc.poll() is None:
             return
         if daemon_running():
-            self.flash("The background service is running — it syncs "
-                       "automatically when files change.")
+            state = (read_status() or {}).get("state", "")
+            if state in BUSY_STATES:
+                self.flash("A sync is already running.")
+                return
+            request_sync()
+            self.flash("Sync requested — it starts in a moment.")
             return
         self.sync_btn.set_sensitive(False)
         self.flash("Syncing…")
@@ -636,10 +1269,11 @@ class SettingsWindow(Gtk.ApplicationWindow):
         GLib.timeout_add(1000, self._poll_sync)
 
     def _poll_sync(self):
-        if self.sync_proc and self.sync_proc.poll() is None:
+        if self.sync_proc is not None and self.sync_proc.poll() is None:
             return True
-        self.sync_btn.set_sensitive(True)
-        self.flash("Sync finished — see the Activity tab for details.")
+        self.sync_proc = None
+        self.flash("Sync finished.")
+        self.refresh_activity()
         return False
 
     def on_open_log(self, _btn):
@@ -649,82 +1283,79 @@ class SettingsWindow(Gtk.ApplicationWindow):
         Gtk.show_uri_on_window(self, "file://" + LOG_FILE,
                                Gtk.get_current_event_time())
 
-    def flash(self, text):
-        self.status.set_text(text)
+    def flash(self, text, seconds=4):
+        self.toast_label.set_text(text)
+        self.toast.set_reveal_child(True)
+        if self._toast_timeout:
+            GLib.source_remove(self._toast_timeout)
+        self._toast_timeout = GLib.timeout_add_seconds(seconds, self._hide_toast)
 
-    # ---- settings status line (login check)
-    def refresh_status(self):
-        parts = []
-        if not self.cli:
-            parts.append("⚠ proton-drive binary not found.")
-        parts.append("Service: " +
-                     ("running" if daemon_running() else "not running"))
-        self.status.set_text("   ".join(parts))
-        threading.Thread(target=self._check_login, daemon=True).start()
+    def _hide_toast(self):
+        self.toast.set_reveal_child(False)
+        self._toast_timeout = None
+        return False
+
+    # ---- checks (login + autostart probe in a thread, service inline)
+    def refresh_checks(self):
+        if not self._started:
+            return True
+        self._update_service_row(daemon_running())
+        if self._check_thread is None or not self._check_thread.is_alive():
+            self._check_thread = threading.Thread(target=self._run_checks,
+                                                  daemon=True)
+            self._check_thread.start()
         return True
 
-    def _check_login(self):
-        if not self.cli:
-            return
-        try:
-            r = subprocess.run([self.cli, "filesystem", "list", "/"],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode == 0:
-                msg = "Account: logged in ✓"
-            elif "You need to login first" in (r.stdout + r.stderr):
-                msg = ("Account: NOT logged in — run in a terminal:  "
-                       f"{self.cli} auth login")
-            else:
-                msg = "Account: check failed (offline?)"
-        except (subprocess.TimeoutExpired, OSError):
-            msg = "Account: check failed"
-        GLib.idle_add(self._append_status, msg)
+    def _run_checks(self):
+        autostart = autostart_enabled()
+        login = probe_login(self.cli)
+        GLib.idle_add(self._apply_checks, autostart, login)
 
-    def _append_status(self, msg):
-        current = self.status.get_text().split("\n")[0]
-        self.status.set_text(current + "\n" + msg)
+    def _apply_checks(self, autostart, login):
+        self._autostart = autostart
+        self.check_rows["autostart"].set_content(*autostart_check_result(autostart))
+        self.check_rows["login"].set_content(*login)
+        self._update_service_row(daemon_running())
         return False
+
+    def _update_service_row(self, running):
+        self.check_rows["service"].set_content(
+            *service_check_result(running, self._autostart))
 
     # ---- activity page refresh
     def refresh_activity(self):
-        status = read_status()
+        if not self._started:
+            return True
+        status = read_status() or {}
         running = daemon_running()
-
-        state = (status or {}).get("state", "")
-        if not running and state in ("syncing", "watching", "polling",
-                                     "debouncing"):
+        root = self.cfg.get("LOCAL_ROOT", "")
+        state = status.get("state", "")
+        if not running and state in ACTIVE_STATES:
             state = "stopped"
-        color, text = STATE_TEXT.get(
-            state, ("#868e96", "No sync activity recorded yet"))
+        color, text = state_title(state, status)
         self.state_label.set_markup(
-            f'<span foreground="{color}">●</span>  <b>{GLib.markup_escape_text(text)}</b>')
+            f'<span foreground="{color}">●</span>  <b>{esc(text)}</b>')
+        self.state_detail.set_text(self._state_detail(state, status, root))
 
-        detail = ""
+        manual = self.sync_proc is not None and self.sync_proc.poll() is None
+        self.sync_btn.set_sensitive(not manual and state not in BUSY_STATES)
+
+        rows = read_queue()
+        self._update_queue(rows, running, root)
+        self._update_live(read_events(), root)
+        in_progress = running and state in BUSY_STATES
         if status:
-            if state == "syncing" and status.get("current"):
-                detail = "Uploading: " + status["current"]
-            elif state == "error" and status.get("current"):
-                detail = status["current"]
-            elif state in ("watching", "polling", "stopped", "idle"):
-                detail = "Status updated " + fmt_time(status.get("ts"))
-        self.state_detail.set_text(detail)
+            self.files_heading.set_subtitle(
+                ("This sync: " if in_progress else "Last sync: ")
+                + pass_summary(status, in_progress))
+        self.files_heading.set_info(queue_summary(rows, running))
 
-        if status:
-            self.counter_labels["pass"].set_text(
-                f"{status.get('pass_items', 0)} items · "
-                f"{human_bytes(status.get('pass_bytes', 0))} · "
-                f"{status.get('pass_trashed', 0)} deleted · "
-                f"{status.get('pass_errors', 0)} errors · "
-                f"started {fmt_time(status.get('pass_started'))}"
-            )
-            self.counter_labels["total"].set_text(
-                f"{status.get('passes_done', 0)} passes · "
-                f"{status.get('total_items', 0)} items · "
-                f"{human_bytes(status.get('total_bytes', 0))} · "
-                f"{status.get('total_trashed', 0)} deleted · "
-                f"{status.get('total_errors', 0)} errors"
-            )
+        self._update_problems(describe_problems(
+            status, rows, running,
+            poll_minutes_from_config(self.cfg.get("POLL_INTERVAL")),
+            root, login_command(self.cli)))
 
+        self.history_heading.set_info(total_summary(status) if status else "")
         if self.chart is not None:
             self.chart.set_history(read_history())
 
@@ -732,14 +1363,101 @@ class SettingsWindow(Gtk.ApplicationWindow):
         if text != self._log_cache:
             self._log_cache = text
             buf = self.log_view.get_buffer()
-            sw = self.log_view.get_parent()
-            adj = sw.get_vadjustment()
+            adj = self.log_view.get_parent().get_vadjustment()
             at_bottom = (adj.get_value() + adj.get_page_size()
                          >= adj.get_upper() - 40)
             buf.set_text(text)
             if at_bottom:
                 GLib.idle_add(self._scroll_log_to_end)
+        self._update_service_row(running)
         return True
+
+    @staticmethod
+    def _state_detail(state, status, root):
+        current = str(status.get("current", "") or "")
+        if state == "syncing":
+            prefix = "Checking all files · " if status.get("mode") == "full" else ""
+            if not current:
+                return prefix + "Preparing…"
+            text = prefix + "Uploading " + relative_name(current, root)
+            file = str(status.get("file", "") or "")
+            if file and file != current and file.startswith(current + "/"):
+                text += " · " + file[len(current) + 1:]
+            return text
+        if state == "debouncing":
+            return "Sync starts in a moment"
+        if state == "error":
+            return current
+        if state in ("watching", "polling", "idle"):
+            return "Last sync finished at " + fmt_time(status.get("ts"))
+        if state == "stopped":
+            return "Since " + fmt_time(status.get("ts"))
+        return ""
+
+    def _update_queue(self, rows, running, root):
+        key = (tuple((r["state"], r["path"]) for r in rows), running, root)
+        if key == self._queue_cache:
+            return
+        self._queue_cache = key
+        if not rows:
+            self.files_stack.set_visible_child_name("empty")
+            return
+        self.files_stack.set_visible_child_name("list")
+        self.queue_store.clear()
+        current = None
+        for r in rows:
+            severity = {"done": "ok", "failed": "fail", "pending": "queued",
+                        "unchanged": "unchanged",
+                        "uploading": "busy" if running else "queued"}[r["state"]]
+            color, glyph = GLYPHS[severity]
+            tip = r["path"] + (f"\n{r['note']}" if r["note"] else "")
+            it = self.queue_store.append([
+                f'<span foreground="{color}" weight="bold">{glyph}</span>',
+                relative_name(r["path"], root), esc(tip)])
+            if r["state"] == "uploading" and running:
+                current = self.queue_store.get_path(it)
+        if current is not None:
+            self.queue_view.scroll_to_cell(current, None, False, 0, 0)
+
+    def _update_live(self, events, root):
+        key = (len(events), events[-1] if events else None, root)
+        if key == self._live_cache:
+            return
+        self._live_cache = key
+        if not events:
+            self.live_stack.set_visible_child_name("empty")
+            return
+        self.live_stack.set_visible_child_name("list")
+        self.live_store.clear()
+        login_cmd = login_command(self.cli)
+        for ts, kind, path, detail in reversed(events):
+            severity, text, secondary = describe_event(kind, path, detail,
+                                                       root, login_cmd)
+            color, glyph = GLYPHS[severity]
+            tip = esc(path or text) + (f"\n{esc(detail)}" if detail else "")
+            markup = esc(text)
+            if secondary:
+                markup += f'  <span foreground="#868e96"><small>{esc(secondary)}</small></span>'
+            self.live_store.append([
+                fmt_time(ts),
+                f'<span foreground="{color}" weight="bold">{glyph}</span>',
+                markup, tip])
+
+    def _update_problems(self, problems):
+        if problems == self._problems_cache:
+            return
+        self._problems_cache = problems
+        for child in self.problem_box.get_children():
+            self.problem_box.remove(child)
+        if not problems:
+            row = NoteRow()
+            row.set_content("ok", "No problems")
+            self.problem_box.pack_start(row, False, False, 0)
+        for severity, title, advice, details in problems:
+            row = NoteRow(selectable=True)
+            row.set_content(severity, title, advice, details)
+            self.problem_box.pack_start(row, False, False, 0)
+        self.problem_box.show_all()
 
     def _scroll_log_to_end(self):
         buf = self.log_view.get_buffer()

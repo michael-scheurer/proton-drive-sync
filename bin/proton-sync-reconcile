@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""proton-sync-reconcile — make Proton Drive mirror the local sync folder.
+
+The daemon only mirrors deletions it saw happen (manifest diff). Whatever
+went missing locally while it was off, before deletion sync was turned on,
+or during a failed pass stays on Proton Drive. This tool compares the two
+trees directly, folder by folder, and
+
+  * moves to the Proton Drive TRASH what exists remotely but not locally
+    (only with --apply; the default is a dry run that just reports);
+  * reports what exists locally but not remotely (the daemon uploads that);
+  * reports — and never touches anything below — type mismatches, shared
+    items, names it cannot read, and folders it could not list.
+
+Nothing is ever permanently deleted. Every trashed path is appended to
+$STATE_DIR/reconcile-trashed.txt, so `proton-drive filesystem restore PATH`
+can undo it. Excluded folders are left alone on both sides.
+
+    proton-sync-reconcile                 dry run, prints the plan
+    proton-sync-reconcile --apply         trash remote-only entries
+    proton-sync-reconcile --include-shared   also trash shared remote-only entries
+    proton-sync-reconcile --jobs 8        parallel listing (default 4)
+    proton-sync-reconcile --save-plan F   also write the remote-only list to F
+    proton-sync-reconcile --apply-plan F  trash what F lists, without comparing
+                                          again; entries that exist locally
+                                          again by now are skipped
+
+Exit status: 0 = fully verified, 2 = some folders could not be listed (the
+report says which; nothing beneath them was touched), 1 = usage/config error.
+"""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "proton-sync")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+EXCLUDES_FILE = os.path.join(CONFIG_DIR, "excludes.list")
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "proton-sync")
+TRASHED_FILE = os.path.join(STATE_DIR, "reconcile-trashed.txt")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRASH_BATCH = 25
+LIST_RETRIES = 3
+
+
+# ------------------------------------------------------------ config ---
+def load_config():
+    cfg = {}
+    try:
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, raw = line.partition("=")
+                try:
+                    cfg[key.strip()] = shlex.split(raw)[0] if raw else ""
+                except ValueError:
+                    pass
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def load_excludes():
+    try:
+        with open(EXCLUDES_FILE) as f:
+            return [l.strip().rstrip("/") for l in f
+                    if l.strip() and not l.startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def find_cli(cfg):
+    snap = os.environ.get("SNAP", "")
+    candidates = [
+        cfg.get("PROTON_DRIVE_CLI", ""),
+        os.path.join(snap, "bin", "proton-drive") if snap else "",
+        os.path.join(SCRIPT_DIR, "proton-drive"),
+        os.path.join(SCRIPT_DIR, "..", "proton-drive"),
+        shutil.which("proton-drive") or "",
+    ]
+    for c in candidates:
+        if c and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    return None
+
+
+def normalize_remote_root(remote, local_root):
+    """Same rules as the daemon: default to the local basename, /my-files prefix."""
+    remote = (remote or "").rstrip("/")
+    if not remote:
+        remote = "/" + os.path.basename(local_root.rstrip("/"))
+    if not remote.startswith("/"):
+        remote = "/" + remote
+    if remote != "/my-files" and not remote.startswith("/my-files/"):
+        remote = "/my-files" + remote
+    return remote
+
+
+# -------------------------------------------------------------- core ---
+class Reconciler:
+    def __init__(self, cli, local_root, remote_root, excludes, jobs=4,
+                 include_shared=False, out=sys.stderr):
+        self.cli = cli
+        self.local_root = local_root.rstrip("/")
+        self.remote_root = remote_root
+        self.excludes = set(excludes) | {STATE_DIR.rstrip("/")}
+        self.jobs = max(1, jobs)
+        self.include_shared = include_shared
+        self.out = out
+        self.lock = threading.Lock()
+        self.remote_only = []   # (remote path, type)
+        self.local_only = []    # (local path, type)
+        self.mismatch = []      # (remote path, remote type, local type)
+        self.shared = []        # remote-only but shared -> left alone
+        self.excluded = []      # remote entries whose local path is excluded
+        self.unverified = []    # (remote path, reason) -> nothing beneath touched
+        self.unreadable = []    # remote entries whose name can't be used
+        self.listed = 0
+
+    # -- helpers
+    def is_excluded(self, local_path):
+        return local_path.rstrip("/") in self.excludes
+
+    def _note(self, bucket, item):
+        with self.lock:
+            bucket.append(item)
+
+    def cli_run(self, args, timeout=300):
+        return subprocess.run([self.cli] + args, capture_output=True,
+                              text=True, timeout=timeout)
+
+    def list_remote(self, remote_path):
+        """-> (entries, None) or (None, reason)."""
+        reason = "unknown"
+        for attempt in range(LIST_RETRIES):
+            try:
+                r = self.cli_run(["filesystem", "list", "-j", remote_path])
+            except (subprocess.TimeoutExpired, OSError) as e:
+                reason = str(e)
+            else:
+                if r.returncode == 0:
+                    try:
+                        data = json.loads(r.stdout)
+                        if isinstance(data, list):
+                            return data, None
+                        reason = "unexpected JSON"
+                    except ValueError:
+                        reason = "unparseable output"
+                else:
+                    reason = (r.stdout + r.stderr).strip().splitlines()[-1:] or ["failed"]
+                    reason = reason[0]
+                    if "Node not found" in reason:
+                        return [], None     # remote folder missing: nothing there
+            if attempt + 1 < LIST_RETRIES:
+                time.sleep(2 * (attempt + 1))
+        return None, reason
+
+    # -- one folder
+    def scan_dir(self, rel):
+        """Compare one folder (rel to the roots). Returns child folders to scan."""
+        local_dir = os.path.join(self.local_root, rel) if rel else self.local_root
+        remote_dir = self.remote_root + ("/" + rel if rel else "")
+        entries, reason = self.list_remote(remote_dir)
+        if entries is None:
+            self._note(self.unverified, (remote_dir, reason))
+            return []
+        try:
+            local_names = set(os.listdir(local_dir))
+        except OSError as e:
+            self._note(self.unverified, (remote_dir, f"local: {e}"))
+            return []
+        with self.lock:
+            self.listed += 1
+            if self.listed % 100 == 0:
+                print(f"  … {self.listed} folders compared", file=self.out, flush=True)
+
+        children, seen = [], set()
+        for e in entries:
+            name = (e.get("name") or {})
+            value = name.get("value") if name.get("ok") else None
+            if not value or "/" in value or "\\" in value:
+                self._note(self.unreadable, remote_dir + "/" + (value or "?"))
+                continue
+            seen.add(value)
+            rtype = e.get("type", "")
+            rpath = remote_dir + "/" + value
+            lpath = os.path.join(local_dir, value)
+            if self.is_excluded(lpath):
+                self._note(self.excluded, rpath)
+                continue
+            if value not in local_names:
+                if (e.get("isShared") or e.get("isSharedByUrl")) and not self.include_shared:
+                    self._note(self.shared, rpath)
+                else:
+                    self._note(self.remote_only, (rpath, rtype))
+                continue
+            l_is_dir = os.path.isdir(lpath)
+            if rtype == "folder" and l_is_dir:
+                children.append(os.path.join(rel, value) if rel else value)
+            elif rtype == "folder" or l_is_dir:
+                self._note(self.mismatch,
+                           (rpath, rtype, "folder" if l_is_dir else "file"))
+        for value in local_names - seen:
+            lpath = os.path.join(local_dir, value)
+            if self.is_excluded(lpath):
+                continue
+            self._note(self.local_only,
+                       (lpath, "folder" if os.path.isdir(lpath) else "file"))
+        return children
+
+    def run(self):
+        frontier = [""]
+        with ThreadPoolExecutor(max_workers=self.jobs) as pool:
+            while frontier:
+                frontier = [c for kids in pool.map(self.scan_dir, frontier)
+                            for c in kids]
+        self.remote_only.sort()
+        self.local_only.sort()
+        return self
+
+    # -- apply
+    # -- plans (apply later without a second walk)
+    def save_plan(self, path):
+        plan = {"created": time.strftime("%F %T"), "local_root": self.local_root,
+                "remote_root": self.remote_root,
+                "remote_only": [[p, t] for p, t in self.remote_only],
+                "shared": list(self.shared),
+                "unverified": [[p, r] for p, r in self.unverified]}
+        with open(path, "w") as f:
+            json.dump(plan, f, indent=1, ensure_ascii=False)
+
+    def load_plan(self, path):
+        """Take the remote-only list from a saved plan. Entries that exist
+        locally again are dropped (returned) — never trash what is local."""
+        with open(path) as f:
+            plan = json.load(f)
+        if (plan.get("local_root") != self.local_root
+                or plan.get("remote_root") != self.remote_root):
+            raise ValueError(
+                f"plan is for {plan.get('local_root')} <-> {plan.get('remote_root')}, "
+                f"config says {self.local_root} <-> {self.remote_root}")
+        prefix = self.remote_root + "/"
+        reappeared, keep = [], []
+        for rpath, typ in plan.get("remote_only", []):
+            if not rpath.startswith(prefix):
+                reappeared.append(rpath)          # not ours; refuse quietly
+                continue
+            lpath = os.path.join(self.local_root, rpath[len(prefix):])
+            if os.path.lexists(lpath) or self.is_excluded(lpath):
+                reappeared.append(rpath)
+            else:
+                keep.append((rpath, typ))
+        self.remote_only = sorted(keep)
+        return reappeared
+
+    def trash(self):
+        """Trash every remote-only entry; returns (ok paths, [(path, error)])."""
+        paths = [p for p, _ in self.remote_only]
+        ok, failed = [], []
+        os.makedirs(STATE_DIR, exist_ok=True)
+        for i in range(0, len(paths), TRASH_BATCH):
+            batch = paths[i:i + TRASH_BATCH]
+            r = self._trash_call(batch)
+            if r is True:
+                ok.extend(batch)
+            else:
+                for p in batch:              # batch failed: find the culprit(s)
+                    r1 = self._trash_call([p])
+                    (ok.append(p) if r1 is True else failed.append((p, r1)))
+            with open(TRASHED_FILE, "a") as f:
+                for p in ok[len(ok) - len([b for b in batch if b in ok]):]:
+                    f.write(f"{time.strftime('%F %T')}\t{p}\n")
+        return ok, failed
+
+    def _trash_call(self, paths):
+        try:
+            r = self.cli_run(["filesystem", "trash"] + paths, timeout=600)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return str(e)
+        if r.returncode == 0:
+            return True
+        tail = (r.stdout + r.stderr).strip().splitlines()
+        return tail[-1] if tail else "failed"
+
+
+# ------------------------------------------------------------ report ---
+def report(rc, apply, out):
+    p = lambda *a: print(*a, file=out)
+    p(f"Compared {rc.listed} folders: {rc.local_root}  <->  {rc.remote_root}")
+    p()
+    verb = "Moving to trash" if apply else "Would move to trash"
+    p(f"{verb} ({len(rc.remote_only)} remote-only entries, each with everything inside):")
+    for path, typ in rc.remote_only:
+        p(f"  🗑  {path}" + ("/" if typ == "folder" else ""))
+    if not rc.remote_only:
+        p("  (nothing)")
+    if rc.shared:
+        p()
+        p(f"Left alone because shared ({len(rc.shared)}; use --include-shared to trash them too):")
+        for path in rc.shared:
+            p(f"  🔗  {path}")
+    if rc.excluded:
+        p()
+        p(f"Left alone because excluded locally ({len(rc.excluded)}):")
+        for path in rc.excluded:
+            p(f"  –  {path}")
+    if rc.mismatch:
+        p()
+        p(f"Type mismatch, left alone ({len(rc.mismatch)}):")
+        for path, rtype, ltype in rc.mismatch:
+            p(f"  ⚠  {path}  (remote {rtype}, local {ltype})")
+    if rc.unreadable:
+        p()
+        p(f"Unreadable or unsupported names, left alone ({len(rc.unreadable)}):")
+        for path in rc.unreadable:
+            p(f"  ?  {path}")
+    if rc.unverified:
+        p()
+        p(f"Could NOT compare ({len(rc.unverified)} folders; nothing beneath them was touched):")
+        for path, reason in rc.unverified:
+            p(f"  ✗  {path}  — {reason}")
+    p()
+    files = sum(1 for _, t in rc.local_only if t == "file")
+    folders = len(rc.local_only) - files
+    p(f"Not yet on Proton Drive ({folders} folders, {files} files at the top of each gap; "
+      f"the background sync uploads these):")
+    for path, typ in rc.local_only[:20]:
+        p(f"  ↑  {path}" + ("/" if typ == "folder" else ""))
+    if len(rc.local_only) > 20:
+        p(f"  … and {len(rc.local_only) - 20} more")
+    if not rc.local_only:
+        p("  (nothing)")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true",
+                    help="move remote-only entries to the Proton Drive trash")
+    ap.add_argument("--include-shared", action="store_true",
+                    help="also trash remote-only entries that are shared")
+    ap.add_argument("--jobs", type=int, default=4, help="parallel listings (default 4)")
+    ap.add_argument("--save-plan", metavar="FILE",
+                    help="write the comparison result to FILE for --apply-plan")
+    ap.add_argument("--apply-plan", metavar="FILE",
+                    help="trash the remote-only entries recorded in FILE (no new comparison)")
+    args = ap.parse_args(argv)
+
+    cfg = load_config()
+    local_root = cfg.get("LOCAL_ROOT", "")
+    if not local_root or not os.path.isdir(local_root):
+        print(f"Sync folder not found: {local_root!r} — nothing compared.", file=sys.stderr)
+        return 1
+    cli = find_cli(cfg)
+    if not cli:
+        print("proton-drive binary not found.", file=sys.stderr)
+        return 1
+    remote_root = normalize_remote_root(cfg.get("REMOTE_ROOT", ""), local_root)
+
+    rc = Reconciler(cli, local_root, remote_root, load_excludes(), jobs=args.jobs,
+                    include_shared=args.include_shared)
+    if args.apply_plan:
+        try:
+            reappeared = rc.load_plan(args.apply_plan)
+        except (OSError, ValueError) as e:
+            print(f"Cannot use plan {args.apply_plan}: {e}", file=sys.stderr)
+            return 1
+        print(f"Plan {args.apply_plan}: {len(rc.remote_only)} entries to trash"
+              + (f", {len(reappeared)} skipped because they exist locally again" if reappeared else ""))
+        for p in reappeared:
+            print(f"  ↩  {p}")
+        for p, t in rc.remote_only:
+            print(f"  🗑  {p}" + ("/" if t == "folder" else ""))
+        args.apply = True
+    else:
+        rc.run()
+        report(rc, args.apply, sys.stdout)
+        if args.save_plan:
+            rc.save_plan(args.save_plan)
+            print(f"\nPlan written to {args.save_plan}")
+
+    if args.apply and rc.remote_only:
+        ok, failed = rc.trash()
+        print()
+        print(f"Moved to trash: {len(ok)}   failed: {len(failed)}   "
+              f"(record: {TRASHED_FILE})")
+        for path, err in failed:
+            print(f"  ✗  {path}  — {err}")
+        if failed:
+            return 2
+    return 2 if rc.unverified else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

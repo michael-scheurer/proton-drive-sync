@@ -13,15 +13,22 @@ Proton AG.
 ## What it does
 
 - Uploads a folder of your choice to Proton Drive and keeps it up to date.
-  Changes are detected instantly (inotify) or by periodic polling.
+  Changes are detected instantly (inotify) or by periodic polling, and
+  only what changed is uploaded: folders nothing happened in are skipped,
+  a few edited files go up on their own. Once a day (configurable) a full
+  check re-verifies everything, and "Full check" in the app does so on
+  demand.
 - Skips files that haven't changed, replaces files that have, merges
   folders. Uploads only — nothing is ever downloaded over your local files.
 - Optionally mirrors deletions: delete a file locally and it moves to the
   Proton Drive **trash** (not gone — you can restore it there). This is off
   by default; turn it on in the settings app if you want it.
 - Lets you exclude subfolders you don't want synced.
-- Shows you what's happening: live status, counters, a small chart of
-  recent sync passes, and the log, all in the settings app's Activity tab.
+- Shows you what's happening in plain language: live status, a few health
+  checks (logged in? running? starts at login?), problems with what to do
+  about them, which files are done, uploading or queued, and a small chart
+  of recent syncs. The technical log is one click away for those who want
+  it.
 
 What it deliberately does not do: two-way sync. Your Proton Drive is
 treated as the backup of your folder, never the other way around.
@@ -73,13 +80,46 @@ Proton Drive. Change both in the settings app.
 You shouldn't have to think about it. If you want to check on it anyway:
 
 - The **Activity** tab in the settings app shows the live state, what's
-  currently uploading, and the recent history.
+  currently uploading and what's queued, anything that needs your
+  attention (with the fix), and the recent history. "Sync now" asks the
+  running service for a pass right away. The **Live** toggle in the Files
+  section lists every file as it is added, updated or moved to the trash.
+- Settings take effect on the next sync — no restart needed. Saving starts
+  one.
 - `systemctl --user status proton-sync` tells you whether the service runs.
 - The log lives at `~/.local/state/proton-sync/sync.log`.
 
 A note on the first sync: it uploads everything, so depending on folder
 size and your upstream bandwidth it can take hours or days. Later passes
 only transfer what changed.
+
+## Deleting files
+
+Delete files **in your folder**, not in Proton Drive. With deletion sync on,
+the next sync moves the cloud copy to the Proton Drive trash. Deleting only
+in Proton Drive does not stick: the sync is one-way and never deletes
+anything on your computer, so the file is uploaded again the next time it
+counts as changed or at the next verification of all files.
+
+## Making Proton Drive match your folder exactly
+
+Deletion sync only mirrors deletions it sees happen. If you reorganised
+your folder while the service was off, or before you turned deletion sync
+on, Proton Drive still has the old copies. To catch up:
+
+```bash
+proton-sync-reconcile            # dry run: shows what would move to the trash
+proton-sync-reconcile --apply    # does it
+```
+
+It compares the two trees folder by folder and moves to the Proton Drive
+**trash** whatever exists there but not locally. Nothing is deleted for
+good, and every trashed path is recorded in
+`~/.local/state/proton-sync/reconcile-trashed.txt` so you can put it back
+with `proton-drive filesystem restore PATH`. Shared folders are skipped
+(trashing them would kill the share link) unless you pass
+`--include-shared`; excluded folders are left alone; anything it could not
+compare is reported and left untouched.
 
 ## How deletion sync works (when enabled)
 
@@ -102,8 +142,11 @@ tests/run-tests.sh
 
 The suite runs the daemon against a stub CLI in a sandbox (no network, no
 real account) and covers uploads, excludes, the remote path handling,
-status reporting, deletion propagation and its safety rules, locking, and
-the secret scanner described below.
+status reporting, the upload queue and retries, "sync now" and change
+detection in watch mode, deletion propagation and its safety rules
+(unplugged drive, changed folders, failed uploads never count as
+deletions), locking, the settings app's helpers, and the secret scanner
+described below.
 
 ## Contributing
 

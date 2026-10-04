@@ -27,6 +27,7 @@ say() { printf '\n==> %s\n' "$*"; }
 say "Installing programs to $BIN_DIR"
 install -Dm755 "$HERE/bin/proton-sync-daemon"   "$BIN_DIR/proton-sync-daemon"
 install -Dm755 "$HERE/bin/proton-sync-settings" "$BIN_DIR/proton-sync-settings"
+install -Dm755 "$HERE/bin/proton-sync-reconcile" "$BIN_DIR/proton-sync-reconcile"
 
 say "Installing icon and app launcher"
 install -Dm644 "$HERE/snap/gui/proton-sync.svg" "$ICON_DIR/proton-sync.svg"
